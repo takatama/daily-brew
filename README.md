@@ -1,6 +1,6 @@
 # daily-brew
 
-`daily-brew` is a Cloudflare Worker API that delivers coffee-related news. It uses Gemini with `google_search` grounding to gather fresh candidates, caches them in Workers KV, and serves one current item from `/news`.
+`daily-brew` is a Cloudflare Worker API that delivers coffee-related news. It uses Gemini (`gemini-2.5-flash-lite`) with `google_search` grounding to gather fresh candidates, builds structured data from grounding metadata, caches it in Workers KV, and serves one current item from `/news`.
 
 ## Key Features
 

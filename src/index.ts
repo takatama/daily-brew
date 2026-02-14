@@ -29,7 +29,7 @@ const KEY_PREFIX = 'daily-brew';
 const DEFAULT_ITEMS_PER_LANG = 8;
 const DEFAULT_HISTORY_SIZE = 5;
 const MAX_CANDIDATE_MULTIPLIER = 3;
-const GEMINI_MODEL = 'gemini-3-flash-preview';
+const GEMINI_MODEL = 'gemini-2.5-flash-lite';
 
 export default {
   async fetch(
@@ -164,7 +164,6 @@ async function generateCandidatesWithGemini(
       body: JSON.stringify({
         tools: [{ google_search: {} }],
         generationConfig: {
-          responseMimeType: 'application/json',
           temperature: 0.4,
         },
         contents: [{ role: 'user', parts: [{ text: prompt }] }],
@@ -182,24 +181,29 @@ async function generateCandidatesWithGemini(
   const data = await response.json<{
     candidates?: Array<{
       content?: { parts?: Array<{ text?: string }> };
+      groundingMetadata?: {
+        groundingChunks?: Array<{
+          web?: { uri?: string; title?: string };
+        }>;
+        groundingSupports?: Array<{
+          segment?: { text?: string };
+          groundingChunkIndices?: number[];
+        }>;
+      };
     }>;
   }>();
 
-  const text =
-    data.candidates?.[0]?.content?.parts?.map((p) => p.text ?? '').join('') ??
-    '';
-  if (!text) {
+  const candidate = data.candidates?.[0];
+  if (!candidate) {
     return null;
   }
 
-  const parsed = safeParseJson<{ items?: Partial<NewsItem>[] }>(text);
-  const items = parsed?.items ?? [];
+  const items = buildNewsItemsFromGrounding(candidate, lang);
+  if (items.length === 0) {
+    return null;
+  }
 
-  const nowIso = new Date().toISOString();
-  return items
-    .map((item) => sanitizeNewsItem(item, nowIso))
-    .filter((item): item is NewsItem => item !== null)
-    .slice(0, itemCount);
+  return items.slice(0, itemCount);
 }
 
 async function mergeAndStoreCandidates(
@@ -305,22 +309,7 @@ function buildGeminiPrompt(lang: Lang, itemCount: number): string {
 - テーマ: コーヒー / カフェ / ロースター / 抽出器具 / イベント / 業界動向 / 新製品 / 大会
 - スパム、アフィリエイト、転載まとめを避ける
 - 公式サイト、メーカー、信頼できる媒体を優先
-- summary は日本語で120〜180文字、本文転載はしない
-- publishedAt は不明なら null
-- 必ず厳格JSONのみを返す（前後の説明やMarkdown禁止）
-JSON形式:
-{
-  "items": [
-    {
-      "id": "urlを元に安定したID",
-      "title": "...",
-      "summary": "...",
-      "url": "https://...",
-      "source": "媒体名",
-      "publishedAt": "ISO-8601 or null"
-    }
-  ]
-}
+- 回答は通常の文章でよい（JSON不要）
 件数: ${itemCount}`;
   }
 
@@ -329,23 +318,75 @@ Constraints:
 - Topics: coffee, cafe, roasters, brewing tools, events, industry trends, product launches, competitions
 - Avoid spam, affiliate pages, and repost aggregators
 - Prefer official sources, manufacturers, and reputable media
-- Write summary in English, 120-180 characters, no article copy
-- Use null when publishedAt is unknown
-- Return strict JSON only (no markdown, no extra text)
-JSON format:
-{
-  "items": [
-    {
-      "id": "stable id based on url",
-      "title": "...",
-      "summary": "...",
-      "url": "https://...",
-      "source": "...",
-      "publishedAt": "ISO-8601 or null"
-    }
-  ]
-}
+- Write a concise English answer (JSON is not required)
 Count: ${itemCount}`;
+}
+
+function buildNewsItemsFromGrounding(
+  candidate: {
+    content?: { parts?: Array<{ text?: string }> };
+    groundingMetadata?: {
+      groundingChunks?: Array<{
+        web?: { uri?: string; title?: string };
+      }>;
+      groundingSupports?: Array<{
+        segment?: { text?: string };
+        groundingChunkIndices?: number[];
+      }>;
+    };
+  },
+  lang: Lang,
+): NewsItem[] {
+  const nowIso = new Date().toISOString();
+  const answerText =
+    candidate.content?.parts?.map((part) => part.text ?? '').join(' ').trim() ??
+    '';
+  const chunks = candidate.groundingMetadata?.groundingChunks ?? [];
+  const supports = candidate.groundingMetadata?.groundingSupports ?? [];
+
+  const supportedTexts = supports
+    .map((support) => support.segment?.text?.trim() ?? '')
+    .filter(Boolean);
+  const summaryBase = supportedTexts.join(' ');
+  const summary = (summaryBase || answerText).trim();
+
+  const chunkIndices = new Set<number>();
+  for (const support of supports) {
+    for (const index of support.groundingChunkIndices ?? []) {
+      if (Number.isInteger(index) && index >= 0 && index < chunks.length) {
+        chunkIndices.add(index);
+      }
+    }
+  }
+  if (chunkIndices.size === 0 && chunks.length > 0) {
+    chunkIndices.add(0);
+  }
+
+  const sources = Array.from(chunkIndices)
+    .map((index) => chunks[index]?.web)
+    .filter((web): web is { uri?: string; title?: string } => Boolean(web));
+
+  const primaryUrl = sources.find((source) => source.uri)?.uri ?? '';
+  const sourceNames = sources
+    .map((source) => source.title?.trim() ?? '')
+    .filter(Boolean)
+    .slice(0, 3);
+
+  const title =
+    summary.split(/(?<=[.!?。！？])\s+/u)[0]?.trim() ||
+    (lang === 'ja' ? '最新のコーヒーニュース' : 'Latest coffee news');
+
+  const rawItem: Partial<NewsItem> = {
+    id: hashString(`${lang}:${primaryUrl}:${summary || answerText}`),
+    title,
+    summary,
+    url: primaryUrl,
+    source: sourceNames.join(', ') || 'Google Search Grounding',
+    publishedAt: null,
+  };
+
+  const sanitized = sanitizeNewsItem(rawItem, nowIso);
+  return sanitized ? [sanitized] : [];
 }
 
 function sanitizeNewsItem(
@@ -372,20 +413,6 @@ function sanitizeNewsItem(
     publishedAt: item.publishedAt ?? null,
     generatedAt: nowIso,
   };
-}
-
-function safeParseJson<T>(text: string): T | null {
-  try {
-    return JSON.parse(text) as T;
-  } catch {
-    const match = text.match(/\{[\s\S]*\}/);
-    if (!match) return null;
-    try {
-      return JSON.parse(match[0]) as T;
-    } catch {
-      return null;
-    }
-  }
 }
 
 function normalizeLang(value: string | null): Lang {
