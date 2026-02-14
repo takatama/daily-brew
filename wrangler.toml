@@ -9,9 +9,12 @@ PICK_HISTORY_SIZE = "5"
 CRON_LANGS = "ja,en"
 
 [[kv_namespaces]]
-binding = "DB_KV"
+binding = "KV_DAILY_BREW"
 id = "c9e10bdcf21e416f95b9d7e8eed8f919"
 preview_id = "REPLACE_WITH_PREVIEW_KV_NAMESPACE_ID"
+
+[ai]
+binding = "AI"
 
 [triggers]
 crons = ["0 21 * * *", "0 3 * * *", "0 9 * * *"]
