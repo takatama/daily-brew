@@ -29,14 +29,22 @@ const KEY_PREFIX = 'daily-brew';
 const DEFAULT_ITEMS_PER_LANG = 8;
 const DEFAULT_HISTORY_SIZE = 5;
 const MAX_CANDIDATE_MULTIPLIER = 3;
-const GEMINI_MODEL = 'gemini-2.0-flash';
+const GEMINI_MODEL = 'gemini-3-flash-preview';
 
 export default {
-  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  async fetch(
+    request: Request,
+    env: Env,
+    ctx: ExecutionContext,
+  ): Promise<Response> {
     const url = new URL(request.url);
 
     if (request.method === 'OPTIONS') {
-      return buildCorsResponse(new Response(null, { status: 204 }), request, env);
+      return buildCorsResponse(
+        new Response(null, { status: 204 }),
+        request,
+        env,
+      );
     }
 
     if (request.method === 'GET' && url.pathname === '/news') {
@@ -52,7 +60,11 @@ export default {
     );
   },
 
-  async scheduled(_controller: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {
+  async scheduled(
+    _controller: ScheduledController,
+    env: Env,
+    _ctx: ExecutionContext,
+  ): Promise<void> {
     const langs = parseCronLangs(env.CRON_LANGS);
     for (const lang of langs) {
       try {
@@ -67,7 +79,11 @@ export default {
   },
 };
 
-async function handleGetNews(lang: Lang, env: Env, _ctx: ExecutionContext): Promise<Response> {
+async function handleGetNews(
+  lang: Lang,
+  env: Env,
+  _ctx: ExecutionContext,
+): Promise<Response> {
   const currentKey = kvKey('current', lang);
   const current = await env.DB_KV.get<CurrentPayload>(currentKey, 'json');
   if (current?.item) {
@@ -102,7 +118,9 @@ async function refreshLanguageNews(lang: Lang, env: Env): Promise<void> {
   const generated = await generateCandidatesWithGemini(lang, env);
 
   if (!generated || generated.length === 0) {
-    console.log(`[daily-brew] skipped updating ${lang}: Gemini returned no candidates`);
+    console.log(
+      `[daily-brew] skipped updating ${lang}: Gemini returned no candidates`,
+    );
     return;
   }
 
@@ -111,7 +129,9 @@ async function refreshLanguageNews(lang: Lang, env: Env): Promise<void> {
   const picked = selectNextCandidate(merged, history, getHistorySize(env));
 
   if (!picked) {
-    console.log(`[daily-brew] skipped updating ${lang}: no selectable candidate`);
+    console.log(
+      `[daily-brew] skipped updating ${lang}: no selectable candidate`,
+    );
     return;
   }
 
@@ -126,7 +146,10 @@ async function refreshLanguageNews(lang: Lang, env: Env): Promise<void> {
   await env.DB_KV.put(kvKey('history', lang), JSON.stringify(updatedHistory));
 }
 
-async function generateCandidatesWithGemini(lang: Lang, env: Env): Promise<NewsItem[] | null> {
+async function generateCandidatesWithGemini(
+  lang: Lang,
+  env: Env,
+): Promise<NewsItem[] | null> {
   const itemCount = getItemsPerLang(env);
   const prompt = buildGeminiPrompt(lang, itemCount);
 
@@ -150,7 +173,9 @@ async function generateCandidatesWithGemini(lang: Lang, env: Env): Promise<NewsI
   );
 
   if (!response.ok) {
-    console.error(`[daily-brew] Gemini API failed for ${lang}: ${response.status}`);
+    console.error(
+      `[daily-brew] Gemini API failed for ${lang}: ${response.status}`,
+    );
     return null;
   }
 
@@ -160,7 +185,9 @@ async function generateCandidatesWithGemini(lang: Lang, env: Env): Promise<NewsI
     }>;
   }>();
 
-  const text = data.candidates?.[0]?.content?.parts?.map((p) => p.text ?? '').join('') ?? '';
+  const text =
+    data.candidates?.[0]?.content?.parts?.map((p) => p.text ?? '').join('') ??
+    '';
   if (!text) {
     return null;
   }
@@ -175,7 +202,11 @@ async function generateCandidatesWithGemini(lang: Lang, env: Env): Promise<NewsI
     .slice(0, itemCount);
 }
 
-async function mergeAndStoreCandidates(lang: Lang, newItems: NewsItem[], env: Env): Promise<NewsItem[]> {
+async function mergeAndStoreCandidates(
+  lang: Lang,
+  newItems: NewsItem[],
+  env: Env,
+): Promise<NewsItem[]> {
   const existing = await getCandidates(lang, env);
   const mergedMap = new Map<string, NewsItem>();
 
@@ -192,7 +223,11 @@ async function mergeAndStoreCandidates(lang: Lang, newItems: NewsItem[], env: En
   return merged;
 }
 
-function selectNextCandidate(candidates: NewsItem[], history: NewsItem[], historySize: number): NewsItem | null {
+function selectNextCandidate(
+  candidates: NewsItem[],
+  history: NewsItem[],
+  historySize: number,
+): NewsItem | null {
   if (candidates.length === 0) return null;
 
   const strictFiltered = candidates.filter(
@@ -224,7 +259,11 @@ function isBlockedByHistory(candidate: NewsItem, history: NewsItem[]): boolean {
     const pTitle = normalizeTitle(past.title);
     if (!cTitle || !pTitle) continue;
 
-    if (cTitle === pTitle || cTitle.includes(pTitle) || pTitle.includes(cTitle)) {
+    if (
+      cTitle === pTitle ||
+      cTitle.includes(pTitle) ||
+      pTitle.includes(cTitle)
+    ) {
       return true;
     }
 
@@ -236,17 +275,27 @@ function isBlockedByHistory(candidate: NewsItem, history: NewsItem[]): boolean {
   return false;
 }
 
-function updateHistory(history: NewsItem[], picked: NewsItem, historySize: number): NewsItem[] {
-  const filtered = history.filter((item) => normalizeUrl(item.url) !== normalizeUrl(picked.url));
+function updateHistory(
+  history: NewsItem[],
+  picked: NewsItem,
+  historySize: number,
+): NewsItem[] {
+  const filtered = history.filter(
+    (item) => normalizeUrl(item.url) !== normalizeUrl(picked.url),
+  );
   return [picked, ...filtered].slice(0, historySize);
 }
 
 async function getCandidates(lang: Lang, env: Env): Promise<NewsItem[]> {
-  return (await env.DB_KV.get<NewsItem[]>(kvKey('candidates', lang), 'json')) ?? [];
+  return (
+    (await env.DB_KV.get<NewsItem[]>(kvKey('candidates', lang), 'json')) ?? []
+  );
 }
 
 async function getHistory(lang: Lang, env: Env): Promise<NewsItem[]> {
-  return (await env.DB_KV.get<NewsItem[]>(kvKey('history', lang), 'json')) ?? [];
+  return (
+    (await env.DB_KV.get<NewsItem[]>(kvKey('history', lang), 'json')) ?? []
+  );
 }
 
 function buildGeminiPrompt(lang: Lang, itemCount: number): string {
@@ -299,7 +348,10 @@ JSON format:
 Count: ${itemCount}`;
 }
 
-function sanitizeNewsItem(item: Partial<NewsItem>, nowIso: string): NewsItem | null {
+function sanitizeNewsItem(
+  item: Partial<NewsItem>,
+  nowIso: string,
+): NewsItem | null {
   const title = item.title?.trim();
   const summary = item.summary?.trim();
   const url = item.url?.trim();
@@ -308,7 +360,8 @@ function sanitizeNewsItem(item: Partial<NewsItem>, nowIso: string): NewsItem | n
   if (!title || !summary || !url || !source) return null;
 
   const normalizedUrl = normalizeUrl(url);
-  const id = item.id?.trim() || hashString(normalizedUrl || `${title}-${source}`);
+  const id =
+    item.id?.trim() || hashString(normalizedUrl || `${title}-${source}`);
 
   return {
     id,
@@ -350,12 +403,16 @@ function parseCronLangs(raw?: string): Lang[] {
 
 function getItemsPerLang(env: Env): number {
   const parsed = Number(env.NEWS_ITEMS_PER_LANG ?? DEFAULT_ITEMS_PER_LANG);
-  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : DEFAULT_ITEMS_PER_LANG;
+  return Number.isFinite(parsed) && parsed > 0
+    ? Math.floor(parsed)
+    : DEFAULT_ITEMS_PER_LANG;
 }
 
 function getHistorySize(env: Env): number {
   const parsed = Number(env.PICK_HISTORY_SIZE ?? DEFAULT_HISTORY_SIZE);
-  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : DEFAULT_HISTORY_SIZE;
+  return Number.isFinite(parsed) && parsed > 0
+    ? Math.floor(parsed)
+    : DEFAULT_HISTORY_SIZE;
 }
 
 function kvKey(type: 'candidates' | 'current' | 'history', lang: Lang): string {
@@ -406,7 +463,11 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
-function buildCorsResponse(response: Response, request: Request, env: Env): Response {
+function buildCorsResponse(
+  response: Response,
+  request: Request,
+  env: Env,
+): Response {
   const origin = request.headers.get('Origin');
   const headers = new Headers(response.headers);
   headers.set('Vary', 'Origin');
