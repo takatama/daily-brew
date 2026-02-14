@@ -55,7 +55,14 @@ export default {
   async scheduled(_controller: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {
     const langs = parseCronLangs(env.CRON_LANGS);
     for (const lang of langs) {
-      await refreshLanguageNews(lang, env);
+      try {
+        await refreshLanguageNews(lang, env);
+      } catch (error) {
+        console.error(
+          `[daily-brew] scheduled refresh failed for ${lang}`,
+          error instanceof Error ? error.message : String(error),
+        );
+      }
     }
   },
 };
