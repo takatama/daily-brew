@@ -1,6 +1,6 @@
 interface Env {
-  DB_KV: KVNamespace;
-  GEMINI_API_KEY: string;
+  KV_DAILY_BREW: KVNamespace;
+  AI: Ai;
   ALLOWED_ORIGIN: string;
   NEWS_ITEMS_PER_LANG?: string;
   PICK_HISTORY_SIZE?: string;
@@ -25,11 +25,30 @@ type CurrentPayload = {
   item: NewsItem;
 };
 
+type FeedEntry = {
+  title: string;
+  url: string;
+  source: string;
+  publishedAt: string | null;
+  content: string;
+};
+
 const KEY_PREFIX = 'daily-brew';
 const DEFAULT_ITEMS_PER_LANG = 8;
 const DEFAULT_HISTORY_SIZE = 5;
 const MAX_CANDIDATE_MULTIPLIER = 3;
-const GEMINI_MODEL = 'gemini-3-flash-preview';
+const SUMMARY_MODEL = '@cf/meta/llama-3.1-8b-instruct';
+
+const RSS_FEEDS: Record<Lang, string[]> = {
+  ja: [
+    'https://prtimes.jp/topics/keywords/%E3%82%B3%E3%83%BC%E3%83%92%E3%83%BC/rss',
+    'https://news.yahoo.co.jp/rss/topics/top-picks.xml',
+  ],
+  en: [
+    'https://sprudge.com/feed',
+    'https://dailycoffeenews.com/feed/',
+  ],
+};
 
 export default {
   async fetch(
@@ -85,7 +104,7 @@ async function handleGetNews(
   _ctx: ExecutionContext,
 ): Promise<Response> {
   const currentKey = kvKey('current', lang);
-  const current = await env.DB_KV.get<CurrentPayload>(currentKey, 'json');
+  const current = await env.KV_DAILY_BREW.get<CurrentPayload>(currentKey, 'json');
   if (current?.item) {
     return jsonResponse(current, 200);
   }
@@ -107,20 +126,18 @@ async function handleGetNews(
     item: picked,
   };
 
-  await env.DB_KV.put(currentKey, JSON.stringify(payload));
+  await env.KV_DAILY_BREW.put(currentKey, JSON.stringify(payload));
   const updatedHistory = updateHistory(history, picked, getHistorySize(env));
-  await env.DB_KV.put(kvKey('history', lang), JSON.stringify(updatedHistory));
+  await env.KV_DAILY_BREW.put(kvKey('history', lang), JSON.stringify(updatedHistory));
 
   return jsonResponse(payload, 200);
 }
 
 async function refreshLanguageNews(lang: Lang, env: Env): Promise<void> {
-  const generated = await generateCandidatesWithGemini(lang, env);
+  const generated = await generateCandidatesFromRss(lang, env);
 
   if (!generated || generated.length === 0) {
-    console.log(
-      `[daily-brew] skipped updating ${lang}: Gemini returned no candidates`,
-    );
+    console.log(`[daily-brew] skipped updating ${lang}: RSS returned no candidates`);
     return;
   }
 
@@ -141,65 +158,227 @@ async function refreshLanguageNews(lang: Lang, env: Env): Promise<void> {
     item: picked,
   };
 
-  await env.DB_KV.put(kvKey('current', lang), JSON.stringify(currentPayload));
+  await env.KV_DAILY_BREW.put(kvKey('current', lang), JSON.stringify(currentPayload));
   const updatedHistory = updateHistory(history, picked, getHistorySize(env));
-  await env.DB_KV.put(kvKey('history', lang), JSON.stringify(updatedHistory));
+  await env.KV_DAILY_BREW.put(kvKey('history', lang), JSON.stringify(updatedHistory));
 }
 
-async function generateCandidatesWithGemini(
+async function generateCandidatesFromRss(
   lang: Lang,
   env: Env,
-): Promise<NewsItem[] | null> {
+): Promise<NewsItem[]> {
   const itemCount = getItemsPerLang(env);
-  const prompt = buildGeminiPrompt(lang, itemCount);
+  const maxCandidates = itemCount * MAX_CANDIDATE_MULTIPLIER;
 
-  const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-goog-api-key': env.GEMINI_API_KEY,
+  const entries = await collectRssEntries(lang);
+  const nowIso = new Date().toISOString();
+
+  const uniqueEntries = dedupeFeedEntries(entries).slice(0, maxCandidates);
+  const items: NewsItem[] = [];
+
+  for (const entry of uniqueEntries) {
+    const summary = await summarizeEntry(entry, lang, env);
+    const item = sanitizeNewsItem(
+      {
+        title: entry.title,
+        summary,
+        url: entry.url,
+        source: entry.source,
+        publishedAt: entry.publishedAt,
       },
-      body: JSON.stringify({
-        tools: [{ google_search: {} }],
-        generationConfig: {
-          responseMimeType: 'application/json',
-          temperature: 0.4,
+      nowIso,
+    );
+    if (item) {
+      items.push(item);
+    }
+  }
+
+  return items.slice(0, maxCandidates);
+}
+
+async function collectRssEntries(lang: Lang): Promise<FeedEntry[]> {
+  const feeds = RSS_FEEDS[lang] ?? [];
+  const allEntries: FeedEntry[] = [];
+
+  for (const feedUrl of feeds) {
+    try {
+      const response = await fetch(feedUrl, {
+        headers: {
+          'User-Agent': 'daily-brew-worker/1.0',
+          Accept: 'application/rss+xml, application/atom+xml, text/xml',
         },
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
-      }),
-    },
+      });
+
+      if (!response.ok) {
+        console.warn(`[daily-brew] RSS fetch failed: ${feedUrl} (${response.status})`);
+        continue;
+      }
+
+      const xml = await response.text();
+      const source = new URL(feedUrl).hostname;
+      allEntries.push(...parseRssOrAtom(xml, source));
+    } catch (error) {
+      console.warn(
+        `[daily-brew] RSS fetch error: ${feedUrl}`,
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+  }
+
+  return allEntries;
+}
+
+function parseRssOrAtom(xml: string, defaultSource: string): FeedEntry[] {
+  const normalized = xml.replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1');
+  const rssItems = extractBlocks(normalized, 'item').map((block) =>
+    parseRssItem(block, defaultSource),
+  );
+  const atomEntries = extractBlocks(normalized, 'entry').map((block) =>
+    parseAtomEntry(block, defaultSource),
   );
 
-  if (!response.ok) {
-    console.error(
-      `[daily-brew] Gemini API failed for ${lang}: ${response.status}`,
+  return [...rssItems, ...atomEntries].filter(
+    (entry): entry is FeedEntry => entry !== null,
+  );
+}
+
+function extractBlocks(xml: string, tag: string): string[] {
+  const regex = new RegExp(`<${tag}\\b[\\s\\S]*?<\\/${tag}>`, 'gi');
+  return xml.match(regex) ?? [];
+}
+
+function parseRssItem(block: string, defaultSource: string): FeedEntry | null {
+  const title = decodeHtml(stripTags(getTagContent(block, 'title'))).trim();
+  const url = decodeHtml(stripTags(getTagContent(block, 'link'))).trim();
+  const description = decodeHtml(
+    stripTags(
+      getTagContent(block, 'description') || getTagContent(block, 'content:encoded'),
+    ),
+  ).trim();
+  const source =
+    decodeHtml(stripTags(getTagContent(block, 'source'))).trim() || defaultSource;
+  const publishedAt = toIsoDate(getTagContent(block, 'pubDate'));
+
+  if (!title || !url) {
+    return null;
+  }
+
+  return {
+    title,
+    url,
+    source,
+    publishedAt,
+    content: description || title,
+  };
+}
+
+function parseAtomEntry(block: string, defaultSource: string): FeedEntry | null {
+  const title = decodeHtml(stripTags(getTagContent(block, 'title'))).trim();
+  const href = block.match(/<link[^>]*href=["']([^"']+)["'][^>]*>/i)?.[1] ?? '';
+  const url = decodeHtml(href.trim());
+  const summary = decodeHtml(
+    stripTags(getTagContent(block, 'summary') || getTagContent(block, 'content')),
+  ).trim();
+  const source = defaultSource;
+  const publishedAt = toIsoDate(
+    getTagContent(block, 'updated') || getTagContent(block, 'published'),
+  );
+
+  if (!title || !url) {
+    return null;
+  }
+
+  return {
+    title,
+    url,
+    source,
+    publishedAt,
+    content: summary || title,
+  };
+}
+
+function getTagContent(block: string, tagName: string): string {
+  const escapedTag = tagName.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&');
+  const regex = new RegExp(`<${escapedTag}[^>]*>([\\s\\S]*?)<\\/${escapedTag}>`, 'i');
+  return block.match(regex)?.[1] ?? '';
+}
+
+function stripTags(input: string): string {
+  return input.replace(/<[^>]*>/g, ' ');
+}
+
+function decodeHtml(input: string): string {
+  return input
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#x2F;/g, '/');
+}
+
+function toIsoDate(raw: string): string | null {
+  if (!raw) return null;
+  const d = new Date(raw.trim());
+  return Number.isNaN(d.getTime()) ? null : d.toISOString();
+}
+
+function dedupeFeedEntries(entries: FeedEntry[]): FeedEntry[] {
+  const merged = new Map<string, FeedEntry>();
+  for (const entry of entries) {
+    const key = normalizeUrl(entry.url) || hashString(entry.title);
+    if (!merged.has(key)) {
+      merged.set(key, entry);
+    }
+  }
+  return Array.from(merged.values());
+}
+
+async function summarizeEntry(entry: FeedEntry, lang: Lang, env: Env): Promise<string> {
+  const fallback = fallbackSummary(entry.content, lang);
+
+  try {
+    const instruction =
+      lang === 'ja'
+        ? '次のニュースを日本語で100〜160文字に要約してください。URLや推測は書かず、事実のみ。'
+        : 'Summarize this news item in English within 100-160 characters. No URL, no speculation, facts only.';
+
+    const result = await env.AI.run(SUMMARY_MODEL, {
+      messages: [
+        { role: 'system', content: instruction },
+        {
+          role: 'user',
+          content: `Title: ${entry.title}\nSource: ${entry.source}\nContent: ${entry.content}`,
+        },
+      ],
+      temperature: 0.2,
+      max_tokens: 180,
+    });
+
+    const responseText =
+      typeof result === 'object' && result && 'response' in result
+        ? String((result as { response?: string }).response ?? '')
+        : '';
+
+    const summary = responseText.trim();
+    return summary ? summary.slice(0, 220) : fallback;
+  } catch (error) {
+    console.warn(
+      `[daily-brew] AI summary failed for ${entry.url}`,
+      error instanceof Error ? error.message : String(error),
     );
-    return null;
+    return fallback;
   }
+}
 
-  const data = await response.json<{
-    candidates?: Array<{
-      content?: { parts?: Array<{ text?: string }> };
-    }>;
-  }>();
-
-  const text =
-    data.candidates?.[0]?.content?.parts?.map((p) => p.text ?? '').join('') ??
-    '';
+function fallbackSummary(content: string, lang: Lang): string {
+  const text = content.replace(/\s+/g, ' ').trim();
   if (!text) {
-    return null;
+    return lang === 'ja'
+      ? '記事本文の要約を生成できませんでした。'
+      : 'Unable to generate a summary for this article.';
   }
-
-  const parsed = safeParseJson<{ items?: Partial<NewsItem>[] }>(text);
-  const items = parsed?.items ?? [];
-
-  const nowIso = new Date().toISOString();
-  return items
-    .map((item) => sanitizeNewsItem(item, nowIso))
-    .filter((item): item is NewsItem => item !== null)
-    .slice(0, itemCount);
+  return text.slice(0, 180);
 }
 
 async function mergeAndStoreCandidates(
@@ -219,7 +398,7 @@ async function mergeAndStoreCandidates(
 
   const maxCandidates = getItemsPerLang(env) * MAX_CANDIDATE_MULTIPLIER;
   const merged = Array.from(mergedMap.values()).slice(0, maxCandidates);
-  await env.DB_KV.put(kvKey('candidates', lang), JSON.stringify(merged));
+  await env.KV_DAILY_BREW.put(kvKey('candidates', lang), JSON.stringify(merged));
   return merged;
 }
 
@@ -288,64 +467,15 @@ function updateHistory(
 
 async function getCandidates(lang: Lang, env: Env): Promise<NewsItem[]> {
   return (
-    (await env.DB_KV.get<NewsItem[]>(kvKey('candidates', lang), 'json')) ?? []
+    (await env.KV_DAILY_BREW.get<NewsItem[]>(kvKey('candidates', lang), 'json')) ??
+    []
   );
 }
 
 async function getHistory(lang: Lang, env: Env): Promise<NewsItem[]> {
   return (
-    (await env.DB_KV.get<NewsItem[]>(kvKey('history', lang), 'json')) ?? []
+    (await env.KV_DAILY_BREW.get<NewsItem[]>(kvKey('history', lang), 'json')) ?? []
   );
-}
-
-function buildGeminiPrompt(lang: Lang, itemCount: number): string {
-  if (lang === 'ja') {
-    return `あなたは編集者です。google_search tool を使って、過去24〜48時間を優先した最新のコーヒー関連ニュースを収集してください。
-条件:
-- テーマ: コーヒー / カフェ / ロースター / 抽出器具 / イベント / 業界動向 / 新製品 / 大会
-- スパム、アフィリエイト、転載まとめを避ける
-- 公式サイト、メーカー、信頼できる媒体を優先
-- summary は日本語で120〜180文字、本文転載はしない
-- publishedAt は不明なら null
-- 必ず厳格JSONのみを返す（前後の説明やMarkdown禁止）
-JSON形式:
-{
-  "items": [
-    {
-      "id": "urlを元に安定したID",
-      "title": "...",
-      "summary": "...",
-      "url": "https://...",
-      "source": "媒体名",
-      "publishedAt": "ISO-8601 or null"
-    }
-  ]
-}
-件数: ${itemCount}`;
-  }
-
-  return `You are a news editor. Use the google_search tool to gather the latest coffee-related news, prioritizing articles from the last 24-48 hours.
-Constraints:
-- Topics: coffee, cafe, roasters, brewing tools, events, industry trends, product launches, competitions
-- Avoid spam, affiliate pages, and repost aggregators
-- Prefer official sources, manufacturers, and reputable media
-- Write summary in English, 120-180 characters, no article copy
-- Use null when publishedAt is unknown
-- Return strict JSON only (no markdown, no extra text)
-JSON format:
-{
-  "items": [
-    {
-      "id": "stable id based on url",
-      "title": "...",
-      "summary": "...",
-      "url": "https://...",
-      "source": "...",
-      "publishedAt": "ISO-8601 or null"
-    }
-  ]
-}
-Count: ${itemCount}`;
 }
 
 function sanitizeNewsItem(
@@ -372,20 +502,6 @@ function sanitizeNewsItem(
     publishedAt: item.publishedAt ?? null,
     generatedAt: nowIso,
   };
-}
-
-function safeParseJson<T>(text: string): T | null {
-  try {
-    return JSON.parse(text) as T;
-  } catch {
-    const match = text.match(/\{[\s\S]*\}/);
-    if (!match) return null;
-    try {
-      return JSON.parse(match[0]) as T;
-    } catch {
-      return null;
-    }
-  }
 }
 
 function normalizeLang(value: string | null): Lang {

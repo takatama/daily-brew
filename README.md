@@ -1,13 +1,13 @@
 # daily-brew
 
-`daily-brew` is a Cloudflare Worker API that delivers coffee-related news. It uses Gemini with `google_search` grounding to gather fresh candidates, caches them in Workers KV, and serves one current item from `/news`.
+`daily-brew` is a Cloudflare Worker API that delivers coffee-related news. It gathers fresh candidates from RSS feeds, creates short summaries with Workers AI, caches them in Workers KV, and serves one current item from `/news`.
 
 ## Key Features
 
-- AI-powered news collection -> KV-cached delivery
-- `ja` and `en` are generated from **independent source discovery** (not translation)
+- RSS-based news ingestion -> Workers AI summarization -> KV-cached delivery
+- `ja` and `en` are generated from **independent feed sets** (not translation)
 - Consecutive duplicate avoidance using URL match + normalized title similarity checks
-- Gemini API key is kept server-side as a Worker secret (`GEMINI_API_KEY`) and never exposed to clients
+- All AI calls are handled inside Workers via the `AI` binding (no client exposure)
 
 ## API
 
@@ -31,30 +31,24 @@
 
 ## Scheduled Flow (Cron)
 
-1. Collect language-specific candidates via Gemini (`google_search` tool)
-2. Merge with existing candidates and deduplicate by URL
-3. Select `current` while avoiding repeated content based on `history`
-4. Save `current` and prepend to `history` (trimmed to configured size)
+1. Fetch language-specific RSS feeds
+2. Parse + deduplicate candidate articles by normalized URL
+3. Generate summaries with Workers AI
+4. Merge with existing candidates, then select `current` while avoiding repeated content from `history`
+5. Save `current` and prepend to `history` (trimmed to configured size)
 
 ## Setup
 
 ```bash
 npm install -D wrangler typescript @cloudflare/workers-types
-npx wrangler kv namespace create DB_KV
-npx wrangler secret put GEMINI_API_KEY
+npx wrangler kv namespace create KV_DAILY_BREW
 ```
 
 Replace KV namespace IDs in `wrangler.toml`.
 
 ## Local Development
 
-create a `.dev.vars` file with:
-
-```
-GEMINI_API_KEY=your_gemini_api_key_here
-```
-
-Then run:
+No API key is needed for summarization when using Workers AI binding in your Cloudflare account.
 
 ```bash
 npx wrangler dev
