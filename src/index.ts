@@ -396,6 +396,20 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
+function isAllowedOrigin(origin: string, allowed: string): boolean {
+  if (origin === allowed) return true;
+  try {
+    const o = new URL(origin);
+    const a = new URL(allowed);
+    return (
+      o.protocol === a.protocol &&
+      (o.hostname === a.hostname || o.hostname.endsWith(`.${a.hostname}`))
+    );
+  } catch {
+    return false;
+  }
+}
+
 function buildCorsResponse(
   response: Response,
   request: Request,
@@ -407,8 +421,8 @@ function buildCorsResponse(
   headers.set('Access-Control-Allow-Methods', 'GET, OPTIONS');
   headers.set('Access-Control-Allow-Headers', 'Content-Type');
 
-  if (origin && origin === env.ALLOWED_ORIGIN) {
-    headers.set('Access-Control-Allow-Origin', env.ALLOWED_ORIGIN);
+  if (origin && isAllowedOrigin(origin, env.ALLOWED_ORIGIN)) {
+    headers.set('Access-Control-Allow-Origin', origin);
   }
 
   return new Response(response.body, {
