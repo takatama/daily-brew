@@ -156,11 +156,8 @@ async function fetchRssItems(lang: Lang, count: number): Promise<RssItem[]> {
 
   const xml = await response.text();
 
-  // Extract <item> blocks
-  const itemBlocks = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)].slice(
-    0,
-    count,
-  );
+  // Extract all <item> blocks; apply count cap after source filtering
+  const itemBlocks = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)];
 
   function extractTag(block: string, tag: string): string {
     // Handle CDATA: <tag><![CDATA[...]]></tag>
@@ -202,7 +199,8 @@ async function fetchRssItems(lang: Lang, count: number): Promise<RssItem[]> {
         !BLOCKED_SOURCES.some((blocked) =>
           item.source.toLowerCase().includes(blocked.toLowerCase()),
         ),
-    );
+    )
+    .slice(0, count);
 }
 
 function deduplicateByTitle(items: RssItem[]): RssItem[] {
