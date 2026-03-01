@@ -1,46 +1,64 @@
 # daily-brew
 
-`daily-brew` is a Cloudflare Worker API that delivers coffee-related news. It uses Gemini with `google_search` grounding to gather fresh candidates, caches them in Workers KV, and serves one current item from `/news`.
+`daily-brew` is a Cloudflare Worker API that delivers one coffee-related news item per language per day. It fetches articles from Google News RSS, deduplicates by title similarity, and uses Gemini 2.5-flash-lite to generate a `short_title` and `summary`. The result is cached in Workers KV and served from `GET /news`.
 
 ## Key Features
 
-- AI-powered news collection -> KV-cached delivery
-- `ja` and `en` are generated from **independent source discovery** (not translation)
-- Consecutive duplicate avoidance using URL match + normalized title similarity checks
-- Gemini API key is kept server-side as a Worker secret (`GEMINI_API_KEY`) and never exposed to clients
+- Google News RSS → Jaccard-based deduplication → Gemini summary generation
+- `ja` and `en` use independent RSS queries (not translation)
+- Press-release sources (PR TIMES, atpress, newscast, etc.) are filtered out
+- Gemini API key is kept server-side as a Worker secret and never exposed to clients
 
 ## API
 
 ### `GET /news?lang=ja|en`
 
 - `lang` defaults to `ja` when omitted
-- Response contains `lang`, `generatedAt`, and `item` (`title`, `summary`, `url`, `source`, `publishedAt`)
-- If `current` is missing, the Worker picks one from `candidates`
-- If no item can be picked, returns `204 No Content`
+- Returns `200` with `{ lang, generatedAt, item }` when content is available
+- Returns `204 No Content` if no item has been generated yet
+
+#### Response shape
+
+```json
+{
+  "lang": "ja",
+  "generatedAt": "2026-03-01T22:00:00.000Z",
+  "item": {
+    "id": "n_1a2b3c4d",
+    "title": "...",
+    "short_title": "...",
+    "summary": "...",
+    "url": "https://...",
+    "source": "...",
+    "publishedAt": "2026-03-01T10:00:00.000Z"
+  }
+}
+```
 
 ### CORS
 
-- `Access-Control-Allow-Origin` is set only when request `Origin` exactly matches `ALLOWED_ORIGIN`
-- `OPTIONS` is implemented
+- `Access-Control-Allow-Origin` is set only when the request `Origin` exactly matches `ALLOWED_ORIGIN`
+- `OPTIONS` preflight is supported
 
 ## KV Keys
 
-- `daily-brew:candidates:ja|en`
-- `daily-brew:current:ja|en`
-- `daily-brew:history:ja|en`
+- `daily-brew:current:ja`
+- `daily-brew:current:en`
 
-## Scheduled Flow (Cron)
+## Scheduled Flow (Cron: `0 22 * * *` UTC = 07:00 JST)
 
-1. Collect language-specific candidates via Gemini (`google_search` tool)
-2. Merge with existing candidates and deduplicate by URL
-3. Select `current` while avoiding repeated content based on `history`
-4. Save `current` and prepend to `history` (trimmed to configured size)
+For each language (`ja`, `en`):
+
+1. Fetch up to 20 items from Google News RSS
+2. Remove near-duplicates (Jaccard similarity > 0.6) and take top 5
+3. Pass titles to Gemini 2.5-flash-lite → receive `short_title` + `summary` as JSON
+4. Store the first item as `daily-brew:current:{lang}` in KV
 
 ## Setup
 
 ```bash
-npm install -D wrangler typescript @cloudflare/workers-types
-npx wrangler kv namespace create DB_KV
+npm install
+npx wrangler kv namespace create KV_DAILY_BREW
 npx wrangler secret put GEMINI_API_KEY
 ```
 
@@ -48,7 +66,7 @@ Replace KV namespace IDs in `wrangler.toml`.
 
 ## Local Development
 
-create a `.dev.vars` file with:
+Create a `.dev.vars` file:
 
 ```
 GEMINI_API_KEY=your_gemini_api_key_here
@@ -60,25 +78,24 @@ Then run:
 npx wrangler dev
 ```
 
-To manually trigger a scheduled event, run:
+Trigger the scheduled handler manually:
 
 ```bash
 curl "http://localhost:8787/cdn-cgi/handler/scheduled"
 ```
 
-## Verification with curl
+Verify the response:
 
 ```bash
 curl -i "http://localhost:8787/news?lang=ja" -H "Origin: https://coco-timer.pages.dev"
 curl -i "http://localhost:8787/news?lang=en" -H "Origin: https://coco-timer.pages.dev"
 ```
 
-## Expected Usage from Pages
-
-On Pages (`coco-timer.pages.dev`), keep the Worker base URL in something like `NEWS_API_BASE` and call:
+## Usage from Pages
 
 ```ts
-fetch(`${NEWS_API_BASE}/news?lang=ja`);
+const res = await fetch(`${NEWS_API_BASE}/news?lang=ja`);
+if (res.status === 204) {
+  // hide news card
+}
 ```
-
-If the API returns `204`, the UI should hide the news card.
