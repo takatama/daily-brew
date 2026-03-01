@@ -33,22 +33,27 @@ type CurrentPayload = {
 const KEY_PREFIX = 'daily-brew';
 const GEMINI_MODEL = 'gemini-2.5-flash-lite';
 
-// PR・プレスリリース系など自己PRが主体のソースを除外
+// PR・プレスリリース系・新聞・タウン情報など編集記事でないソースを除外（クエリの -site: で弾けなかった場合の二重安全網）
 const BLOCKED_SOURCES = [
   'PR TIMES',
   'PRtimes',
   'prtimes',
+  'アットプレス',
+  'atpress',
+  'newscast',
   'Business Wire',
   'PR Newswire',
   'GlobeNewswire',
   'EIN Presswire',
-  'atpress',
-  'newscast',
+  '新聞',       // 釧路新聞電子版 等の地域紙
+  'タウン情報',  // あきたタウン情報 等
+  'ジャーナル',  // 肥後ジャーナル 等の地域ジャーナル
 ];
 
+// クエリにコーヒー文化・技術系ワードを使い、プレスリリース・地域紙サイトを -site: で除外
 const RSS_URLS: Record<Lang, string> = {
-  ja: 'https://news.google.com/rss/search?q=%E3%83%8F%E3%83%B3%E3%83%89%E3%83%89%E3%83%AA%E3%83%83%E3%83%97+OR+%E3%82%B3%E3%83%BC%E3%83%92%E3%83%BC%E6%8A%BD%E5%87%BA+OR+%E3%82%A8%E3%82%B9%E3%83%97%E3%83%AC%E3%83%83%E3%82%BD%E3%83%9E%E3%82%B7%E3%83%B3+OR+%E3%82%B3%E3%83%BC%E3%83%92%E3%83%BC%E3%82%B0%E3%83%A9%E3%82%A4%E3%83%B3%E3%83%80%E3%83%BC+OR+%E3%83%9B%E3%83%BC%E3%83%A0%E3%83%AD%E3%83%BC%E3%82%B9%E3%83%86%E3%82%A3%E3%83%B3%E3%82%B0&hl=ja&gl=JP&ceid=JP:ja',
-  en: 'https://news.google.com/rss/search?q=home+coffee+brewing+OR+pour+over+coffee+OR+espresso+machine+home+OR+coffee+grinder&hl=en&gl=US&ceid=US:en',
+  ja: 'https://news.google.com/rss/search?q=(%E3%83%8F%E3%83%B3%E3%83%89%E3%83%89%E3%83%AA%E3%83%83%E3%83%97%20OR%20%E3%82%B3%E3%83%BC%E3%83%92%E3%83%BC%E6%8A%BD%E5%87%BA%20OR%20%E3%82%B9%E3%83%9A%E3%82%B7%E3%83%A3%E3%83%AB%E3%83%86%E3%82%A3%E3%82%B3%E3%83%BC%E3%83%92%E3%83%BC%20OR%20%E3%82%B3%E3%83%BC%E3%83%92%E3%83%BC%E7%84%99%E7%85%8E%20OR%20%E3%83%90%E3%83%AA%E3%82%B9%E3%82%BF)%20-site%3Aprtimes.jp%20-site%3Aatpress.ne.jp%20-site%3Anewscast.co.jp%20-site%3Akeizaishimbun.co.jp&hl=ja&gl=JP&ceid=JP:ja',
+  en: 'https://news.google.com/rss/search?q=(pour%20over%20coffee%20OR%20home%20espresso%20OR%20specialty%20coffee%20OR%20coffee%20roasting%20OR%20barista)%20-site%3Abusinesswire.com%20-site%3Aprnewswire.com%20-site%3Aglobenewswire.com&hl=en&gl=US&ceid=US:en',
 };
 
 export default {
