@@ -8,7 +8,7 @@ const BLOCKED_SOURCES = [
   'PR TIMES', 'PRtimes', 'prtimes',
   'アットプレス', 'atpress', 'newscast',
   'Business Wire', 'PR Newswire', 'GlobeNewswire', 'EIN Presswire',
-  '新聞', 'タウン情報',
+  '新聞', 'タウン情報', 'ジャーナル',
 ];
 
 const RSS_URLS = {
