@@ -4,14 +4,11 @@ compatibility_date = "2026-02-14"
 
 [vars]
 ALLOWED_ORIGIN = "https://coco-timer.pages.dev"
-NEWS_ITEMS_PER_LANG = "8"
-PICK_HISTORY_SIZE = "5"
-CRON_LANGS = "ja,en"
 
 [[kv_namespaces]]
-binding = "DB_KV"
+binding = "KV_DAILY_BREW"
 id = "c9e10bdcf21e416f95b9d7e8eed8f919"
 preview_id = "REPLACE_WITH_PREVIEW_KV_NAMESPACE_ID"
 
 [triggers]
-crons = ["0 21 * * *", "0 3 * * *", "0 9 * * *"]
+crons = ["0 22 * * *"]
