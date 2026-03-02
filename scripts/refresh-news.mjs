@@ -9,9 +9,10 @@
  *
  * Required env vars:
  *   GEMINI_API_KEY
- *   CLOUDFLARE_API_TOKEN
- *   CLOUDFLARE_ACCOUNT_ID
+ *   CLOUDFLARE_API_TOKEN   (used by wrangler for KV write)
  */
+
+import { execFileSync } from 'child_process';
 
 // Load .dev.vars automatically (same file used by wrangler dev)
 try {
@@ -22,6 +23,13 @@ try {
     if (m && !process.env[m[1]]) process.env[m[1]] = m[2].trim();
   }
 } catch { /* .dev.vars is optional */ }
+
+// Validate required env vars early
+const MISSING = ['GEMINI_API_KEY', 'CLOUDFLARE_API_TOKEN'].filter(k => !process.env[k]);
+if (MISSING.length) {
+  console.error('Missing required environment variables:', MISSING.join(', '));
+  process.exit(1);
+}
 
 const KV_NAMESPACE_ID = 'c9e10bdcf21e416f95b9d7e8eed8f919';
 const GEMINI_MODEL = 'gemini-2.5-flash-lite';
@@ -159,23 +167,13 @@ async function generateShortTitles(lang, items) {
     .filter(Boolean);
 }
 
-async function writeToKV(lang, items) {
+function writeToKV(lang, items) {
   const key = `${KEY_PREFIX}:current:${lang}`;
   const value = JSON.stringify({ lang, generatedAt: new Date().toISOString(), items });
-  const { CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID } = process.env;
-
-  const res = await fetch(
-    `https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/storage/kv/namespaces/${KV_NAMESPACE_ID}/values/${encodeURIComponent(key)}`,
-    {
-      method: 'PUT',
-      headers: { 'Authorization': `Bearer ${CLOUDFLARE_API_TOKEN}`, 'Content-Type': 'text/plain' },
-      body: value,
-    }
-  );
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`KV write failed: ${res.status} ${err}`);
-  }
+  execFileSync('npx', ['wrangler', 'kv', 'key', 'put', '--namespace-id', KV_NAMESPACE_ID, key, value], {
+    env: process.env,
+    stdio: ['ignore', 'ignore', 'pipe'],
+  });
 }
 
 async function refresh(lang) {
