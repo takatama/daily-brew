@@ -9,7 +9,8 @@
  *
  * Required env vars:
  *   GEMINI_API_KEY
- *   CLOUDFLARE_API_TOKEN   (used by wrangler for KV write)
+ *
+ * KV write uses wrangler's own auth (wrangler login). No token needed.
  */
 
 import { execFileSync } from 'child_process';
@@ -25,13 +26,12 @@ try {
 } catch { /* .dev.vars is optional */ }
 
 // Validate required env vars early
-const MISSING = ['GEMINI_API_KEY', 'CLOUDFLARE_API_TOKEN'].filter(k => !process.env[k]);
-if (MISSING.length) {
-  console.error('Missing required environment variables:', MISSING.join(', '));
+if (!process.env.GEMINI_API_KEY) {
+  console.error('Missing required environment variable: GEMINI_API_KEY');
   process.exit(1);
 }
 
-const KV_NAMESPACE_ID = 'c9e10bdcf21e416f95b9d7e8eed8f919';
+const KV_BINDING = 'KV_DAILY_BREW';  // binding name in wrangler.toml
 const GEMINI_MODEL = 'gemini-2.5-flash-lite';
 const KEY_PREFIX = 'daily-brew';
 
@@ -170,9 +170,12 @@ async function generateShortTitles(lang, items) {
 function writeToKV(lang, items) {
   const key = `${KEY_PREFIX}:current:${lang}`;
   const value = JSON.stringify({ lang, generatedAt: new Date().toISOString(), items });
-  execFileSync('npx', ['wrangler', 'kv', 'key', 'put', '--namespace-id', KV_NAMESPACE_ID, key, value], {
-    env: process.env,
-    stdio: ['ignore', 'ignore', 'pipe'],
+  // Strip CLOUDFLARE_API_TOKEN so wrangler uses its own auth (wrangler login)
+  // instead of a potentially stale token loaded from .dev.vars
+  const { CLOUDFLARE_API_TOKEN: _removed, ...cleanEnv } = process.env;
+  execFileSync('npx', ['wrangler', 'kv', 'key', 'put', '--binding', KV_BINDING, '--remote', key, value], {
+    env: cleanEnv,
+    stdio: 'inherit',
   });
 }
 
