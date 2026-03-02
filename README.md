@@ -95,7 +95,7 @@ curl -i "http://localhost:8787/news?lang=en" -H "Origin: https://coco-timer.page
 
 ## Manual News Refresh
 
-To update KV immediately without waiting for the cron (requires `.dev.vars` with `GEMINI_API_KEY` and `CLOUDFLARE_API_TOKEN`):
+To update KV immediately without waiting for the cron (requires `.dev.vars` with `GEMINI_API_KEY` and `wrangler login` credentials):
 
 ```bash
 npm run refresh-news        # both ja and en
