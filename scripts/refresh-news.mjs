@@ -13,6 +13,16 @@
  *   CLOUDFLARE_ACCOUNT_ID
  */
 
+// Load .dev.vars automatically (same file used by wrangler dev)
+try {
+  const { readFileSync } = await import('fs');
+  const devVars = readFileSync(new URL('../.dev.vars', import.meta.url), 'utf8');
+  for (const line of devVars.split('\n')) {
+    const m = line.match(/^([A-Z_]+)=(.*)$/);
+    if (m && !process.env[m[1]]) process.env[m[1]] = m[2].trim();
+  }
+} catch { /* .dev.vars is optional */ }
+
 const KV_NAMESPACE_ID = 'c9e10bdcf21e416f95b9d7e8eed8f919';
 const GEMINI_MODEL = 'gemini-2.5-flash-lite';
 const KEY_PREFIX = 'daily-brew';
