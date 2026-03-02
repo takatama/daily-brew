@@ -9,11 +9,29 @@
  *
  * Required env vars:
  *   GEMINI_API_KEY
- *   CLOUDFLARE_API_TOKEN
- *   CLOUDFLARE_ACCOUNT_ID
+ *
+ * KV write uses wrangler's own auth (wrangler login). No token needed.
  */
 
-const KV_NAMESPACE_ID = 'c9e10bdcf21e416f95b9d7e8eed8f919';
+import { execFileSync } from 'child_process';
+
+// Load .dev.vars automatically (same file used by wrangler dev)
+try {
+  const { readFileSync } = await import('fs');
+  const devVars = readFileSync(new URL('../.dev.vars', import.meta.url), 'utf8');
+  for (const line of devVars.split('\n')) {
+    const m = line.match(/^([A-Z_]+)=(.*)$/);
+    if (m && !process.env[m[1]]) process.env[m[1]] = m[2].trim();
+  }
+} catch { /* .dev.vars is optional */ }
+
+// Validate required env vars early
+if (!process.env.GEMINI_API_KEY) {
+  console.error('Missing required environment variable: GEMINI_API_KEY');
+  process.exit(1);
+}
+
+const KV_BINDING = 'KV_DAILY_BREW';  // binding name in wrangler.toml
 const GEMINI_MODEL = 'gemini-2.5-flash-lite';
 const KEY_PREFIX = 'daily-brew';
 
@@ -149,23 +167,16 @@ async function generateShortTitles(lang, items) {
     .filter(Boolean);
 }
 
-async function writeToKV(lang, items) {
+function writeToKV(lang, items) {
   const key = `${KEY_PREFIX}:current:${lang}`;
   const value = JSON.stringify({ lang, generatedAt: new Date().toISOString(), items });
-  const { CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID } = process.env;
-
-  const res = await fetch(
-    `https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/storage/kv/namespaces/${KV_NAMESPACE_ID}/values/${encodeURIComponent(key)}`,
-    {
-      method: 'PUT',
-      headers: { 'Authorization': `Bearer ${CLOUDFLARE_API_TOKEN}`, 'Content-Type': 'text/plain' },
-      body: value,
-    }
-  );
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`KV write failed: ${res.status} ${err}`);
-  }
+  // Strip CLOUDFLARE_API_TOKEN so wrangler uses its own auth (wrangler login)
+  // instead of a potentially stale token loaded from .dev.vars
+  const { CLOUDFLARE_API_TOKEN: _removed, ...cleanEnv } = process.env;
+  execFileSync('npx', ['wrangler', 'kv', 'key', 'put', '--binding', KV_BINDING, '--remote', key, value], {
+    env: cleanEnv,
+    stdio: 'inherit',
+  });
 }
 
 async function refresh(lang) {

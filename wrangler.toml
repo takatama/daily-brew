@@ -7,7 +7,7 @@ ALLOWED_ORIGIN = "https://coco-timer.pages.dev"
 
 [[kv_namespaces]]
 binding = "KV_DAILY_BREW"
-id = "c9e10bdcf21e416f95b9d7e8eed8f919"
+id = "450ef4b292ae41968d145b327fcf87c9"
 
 [triggers]
-crons = ["0 22 * * *"]
+crons = ["0 19 * * *"]
