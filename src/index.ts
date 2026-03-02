@@ -17,7 +17,6 @@ type NewsItem = {
   id: string;
   title: string;
   short_title: string;
-  summary: string;
   url: string;
   source: string;
   publishedAt: string | null;
@@ -27,7 +26,7 @@ type NewsItem = {
 type CurrentPayload = {
   lang: Lang;
   generatedAt: string;
-  item: NewsItem;
+  items: NewsItem[];
 };
 
 const KEY_PREFIX = 'daily-brew';
@@ -112,7 +111,7 @@ async function handleGetNews(
     kvKey('current', lang),
     'json',
   );
-  if (current?.item) {
+  if (current?.items?.length) {
     return jsonResponse(current, 200);
   }
   return new Response(null, { status: 204 });
@@ -127,24 +126,23 @@ async function refreshLanguageNews(lang: Lang, env: Env): Promise<void> {
     return;
   }
 
-  const items = await generateSummaries(lang, deduped, env);
+  const items = await generateShortTitles(lang, deduped, env);
 
   if (items.length === 0) {
     console.log(`[daily-brew] skipped ${lang}: Gemini returned no items`);
     return;
   }
 
-  const picked = items[0];
   await env.KV_DAILY_BREW.put(
     kvKey('current', lang),
     JSON.stringify({
       lang,
       generatedAt: new Date().toISOString(),
-      item: picked,
+      items,
     }),
   );
 
-  console.log(`[daily-brew] updated ${lang}: ${picked.title}`);
+  console.log(`[daily-brew] updated ${lang}: ${items.length} items`);
 }
 
 async function fetchRssItems(lang: Lang, count: number): Promise<RssItem[]> {
@@ -226,7 +224,7 @@ function deduplicateByTitle(items: RssItem[]): RssItem[] {
   return result;
 }
 
-async function generateSummaries(
+async function generateShortTitles(
   lang: Lang,
   items: RssItem[],
   env: Env,
@@ -238,36 +236,34 @@ async function generateSummaries(
 
   const prompt =
     lang === 'ja'
-      ? `以下のコーヒーニュースのタイトル一覧を見て、各記事の short_title と summary を生成してください。
+      ? `以下のコーヒーニュースのタイトル一覧を見て、各記事の short_title を生成してください。
 
 タイトル一覧:
 ${titlesJson}
 
 条件:
 - short_title: 20〜30文字の日本語タイトル（記事の核心を簡潔に）
-- summary: 80〜120文字の日本語説明文（記事の内容を推測して自然な文章で）
 - 厳格なJSONのみ返す（マークダウン・前後説明禁止）
 
 JSON形式:
 {
   "items": [
-    { "index": 0, "short_title": "...", "summary": "..." }
+    { "index": 0, "short_title": "..." }
   ]
 }`
-      : `Given the following coffee news titles, generate a short_title and summary for each article.
+      : `Given the following coffee news titles, generate a short_title for each article.
 
 Titles:
 ${titlesJson}
 
 Requirements:
 - short_title: 40-60 character concise title capturing the article's essence
-- summary: 80-120 character description of what the article likely covers
 - Return strict JSON only (no markdown, no extra text)
 
 JSON format:
 {
   "items": [
-    { "index": 0, "short_title": "...", "summary": "..." }
+    { "index": 0, "short_title": "..." }
   ]
 }`;
 
@@ -308,7 +304,7 @@ JSON format:
   if (!text) return [];
 
   const parsed = safeParseJson<{
-    items?: Array<{ index: number; short_title?: string; summary?: string }>;
+    items?: Array<{ index: number; short_title?: string }>;
   }>(text);
 
   if (!parsed?.items) return [];
@@ -318,14 +314,12 @@ JSON format:
       const rss = items[result.index];
       if (!rss) return null;
       const short_title = result.short_title?.trim();
-      const summary = result.summary?.trim();
-      if (!short_title || !summary) return null;
+      if (!short_title) return null;
 
       return {
         id: hashString(normalizeUrl(rss.url) || rss.title),
         title: rss.title,
         short_title,
-        summary,
         url: rss.url,
         source: rss.source,
         publishedAt: rss.publishedAt,

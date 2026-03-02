@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "check-rss": "node scripts/check-rss.mjs"
+    "check-rss": "node scripts/check-rss.mjs",
+    "refresh-news": "node scripts/refresh-news.mjs"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20260214.0",
