@@ -72,7 +72,6 @@ Create a `.dev.vars` file:
 
 ```
 GEMINI_API_KEY=your_gemini_api_key_here
-CLOUDFLARE_API_TOKEN=your_api_token_here
 ```
 
 Start the local dev server:
