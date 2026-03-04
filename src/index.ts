@@ -23,14 +23,23 @@ type NewsItem = {
   generatedAt: string;
 };
 
+type RecentPublishedItem = {
+  url: string;
+  title: string;
+  generatedAt: string;
+};
+
 type CurrentPayload = {
   lang: Lang;
   generatedAt: string;
   items: NewsItem[];
+  recentPublished?: RecentPublishedItem[];
 };
 
 const KEY_PREFIX = 'daily-brew';
 const GEMINI_MODEL = 'gemini-2.5-flash-lite';
+const RSS_CANDIDATE_LIMIT = 100;
+const NO_REPEAT_WINDOW_DAYS = 5;
 
 // PR・プレスリリース系・新聞・タウン情報など編集記事でないソースを除外（クエリの -site: で弾けなかった場合の二重安全網）
 const BLOCKED_SOURCES = [
@@ -118,31 +127,124 @@ async function handleGetNews(
 }
 
 async function refreshLanguageNews(lang: Lang, env: Env): Promise<void> {
-  const raw = await fetchRssItems(lang, 20);
-  const deduped = deduplicateByTitle(raw).slice(0, 5);
+  const current = await env.KV_DAILY_BREW.get<CurrentPayload>(
+    kvKey('current', lang),
+    'json',
+  );
+  const raw = await fetchRssItems(lang, RSS_CANDIDATE_LIMIT);
+  const deduped = deduplicateByTitle(raw);
+  const recentPublished = collectRecentPublishedItems(current);
+  const freshItems = filterItemsAlreadyPublished(deduped, recentPublished).slice(0, 5);
 
-  if (deduped.length === 0) {
-    console.log(`[daily-brew] skipped ${lang}: no RSS items after dedup`);
+  if (freshItems.length === 0) {
+    console.log(`[daily-brew] skipped ${lang}: no fresh RSS items in ${NO_REPEAT_WINDOW_DAYS} days`);
     return;
   }
 
-  const items = await generateShortTitles(lang, deduped, env);
+  const items = await generateShortTitles(lang, freshItems, env);
 
   if (items.length === 0) {
     console.log(`[daily-brew] skipped ${lang}: Gemini returned no items`);
     return;
   }
 
+  const generatedAt = new Date().toISOString();
+  const updatedRecentPublished = buildRecentPublishedItems(
+    recentPublished,
+    items,
+    generatedAt,
+  );
+
   await env.KV_DAILY_BREW.put(
     kvKey('current', lang),
     JSON.stringify({
       lang,
-      generatedAt: new Date().toISOString(),
+      generatedAt,
       items,
+      recentPublished: updatedRecentPublished,
     }),
   );
 
   console.log(`[daily-brew] updated ${lang}: ${items.length} items`);
+}
+
+function collectRecentPublishedItems(
+  current: CurrentPayload | null,
+): RecentPublishedItem[] {
+  if (!current) return [];
+
+  const seeded = current.items.map((item) => ({
+    url: item.url,
+    title: item.title,
+    generatedAt: item.generatedAt || current.generatedAt,
+  }));
+
+  return pruneRecentPublishedItems([...(current.recentPublished ?? []), ...seeded]);
+}
+
+function filterItemsAlreadyPublished(
+  items: RssItem[],
+  recentPublished: RecentPublishedItem[],
+): RssItem[] {
+  if (recentPublished.length === 0) return items;
+
+  const previousUrls = new Set(
+    recentPublished.map((item) => normalizeUrl(item.url)).filter(Boolean),
+  );
+  const previousTitles = new Set(
+    recentPublished.map((item) => normalizeTitle(item.title)).filter(Boolean),
+  );
+
+  return items.filter((item) => {
+    const normalizedUrl = normalizeUrl(item.url);
+    const normalizedTitle = normalizeTitle(item.title);
+    return (
+      !previousUrls.has(normalizedUrl) && !previousTitles.has(normalizedTitle)
+    );
+  });
+}
+
+function buildRecentPublishedItems(
+  previousItems: RecentPublishedItem[],
+  latestItems: NewsItem[],
+  generatedAt: string,
+): RecentPublishedItem[] {
+  const combined = [
+    ...previousItems,
+    ...latestItems.map((item) => ({
+      url: item.url,
+      title: item.title,
+      generatedAt,
+    })),
+  ];
+
+  return pruneRecentPublishedItems(combined);
+}
+
+function pruneRecentPublishedItems(
+  items: RecentPublishedItem[],
+): RecentPublishedItem[] {
+  const cutoffTime = Date.now() - NO_REPEAT_WINDOW_DAYS * 24 * 60 * 60 * 1000;
+  const seen = new Set<string>();
+
+  return items
+    .filter((item) => {
+      const timestamp = new Date(item.generatedAt).getTime();
+      return Number.isFinite(timestamp) && timestamp >= cutoffTime;
+    })
+    .sort(
+      (a, b) =>
+        new Date(a.generatedAt).getTime() - new Date(b.generatedAt).getTime(),
+    )
+    .filter((item) => {
+      const normalizedUrl = normalizeUrl(item.url);
+      const normalizedTitle = normalizeTitle(item.title);
+      const fingerprint = `${normalizedUrl}::${normalizedTitle}`;
+      if (!normalizedUrl && !normalizedTitle) return false;
+      if (seen.has(fingerprint)) return false;
+      seen.add(fingerprint);
+      return true;
+    });
 }
 
 async function fetchRssItems(lang: Lang, count: number): Promise<RssItem[]> {

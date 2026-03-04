@@ -10,4 +10,4 @@ binding = "KV_DAILY_BREW"
 id = "450ef4b292ae41968d145b327fcf87c9"
 
 [triggers]
-crons = ["0 19 * * *"]
+crons = ["0 20 * * *"]

@@ -4,7 +4,7 @@
 
 ## Key Features
 
-- Google News RSS → Jaccard-based deduplication → Gemini `short_title` generation
+- Google News RSS (up to 100 candidates) → Jaccard-based deduplication → 5-day no-repeat filtering → Gemini `short_title` generation
 - `ja` and `en` use independent RSS queries (not translation)
 - Press-release sources (PR TIMES, atpress, newscast, 経済新聞, etc.) are filtered out at the query and source level
 - Gemini API key is kept server-side as a Worker secret and never exposed to clients
@@ -47,14 +47,21 @@
 - `daily-brew:current:ja`
 - `daily-brew:current:en`
 
-## Scheduled Flow (Cron: `0 19 * * *` UTC = 04:00 JST)
+## Scheduled Flow (Cron: `0 20 * * *` UTC = 05:00 JST)
 
 For each language (`ja`, `en`):
 
-1. Fetch up to 20 items from Google News RSS
-2. Remove near-duplicates (Jaccard similarity > 0.6) and take top 5
-3. Pass titles to Gemini 2.5-flash-lite → receive `short_title` as JSON
-4. Store all items as `daily-brew:current:{lang}` in KV
+1. Fetch up to 100 items from Google News RSS
+2. Remove near-duplicates (Jaccard similarity > 0.6)
+3. Exclude items that were already published in the last 5 days (URL/title normalized match)
+4. Take up to 5 fresh items and pass titles to Gemini 2.5-flash-lite → receive `short_title` as JSON
+5. Store `{ lang, generatedAt, items, recentPublished }` in `daily-brew:current:{lang}`
+
+## Freshness / No-Repeat Rule
+
+- The Worker keeps a rolling 5-day publication history per language in the same KV payload (`recentPublished`).
+- A candidate is excluded if its normalized URL or normalized title matches a previously published entry within that 5-day window.
+- If no fresh items remain after filtering, the scheduled run skips updating KV and keeps the previous payload.
 
 ## Setup
 
