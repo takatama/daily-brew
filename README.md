@@ -47,7 +47,7 @@
 - `daily-brew:current:ja`
 - `daily-brew:current:en`
 
-## Scheduled Flow (Cron: `0 22 * * *` UTC = 07:00 JST)
+## Scheduled Flow (Cron: `0 20 * * *` UTC = 05:00 JST)
 
 For each language (`ja`, `en`):
 
