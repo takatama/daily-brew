@@ -73,6 +73,22 @@ npx wrangler secret put GEMINI_API_KEY
 
 Replace the KV namespace ID in `wrangler.toml`.
 
+
+## Placement Hints (Tokyo-latency oriented)
+
+`wrangler.toml` sets the following Placement Hint:
+
+```toml
+[placement]
+region = "gcp:asia-northeast1"
+```
+
+- This does **not** run your Worker inside GCP. It asks Cloudflare to place execution at Cloudflare locations with low latency to GCP Tokyo.
+- This is mainly effective for `fetch` handler traffic (request-time execution).
+- Verify behavior by checking the `cf-placement` response header.
+- Optional minimal debug endpoint idea (only when needed): return `request.cf?.placement` and the `cf-placement` header so you can compare runtime observations without changing main logic.
+- If this Worker continues to handle both edge auth/routing and backend-near API logic, you can later consider splitting into an edge Worker and a backend-near Worker.
+
 ## Local Development
 
 Create a `.dev.vars` file:
