@@ -39,6 +39,8 @@ type CurrentPayload = {
 const KEY_PREFIX = 'daily-brew';
 const GEMINI_MODEL = 'gemini-2.5-flash-lite';
 const RSS_CANDIDATE_LIMIT = 100;
+const GEMINI_CANDIDATE_LIMIT = 20;
+const OUTPUT_ITEM_LIMIT = 5;
 const NO_REPEAT_WINDOW_DAYS = 5;
 
 // PR・プレスリリース系・新聞・タウン情報など編集記事でないソースを除外（クエリの -site: で弾けなかった場合の二重安全網）
@@ -134,14 +136,19 @@ async function refreshLanguageNews(lang: Lang, env: Env): Promise<void> {
   const raw = await fetchRssItems(lang, RSS_CANDIDATE_LIMIT);
   const deduped = deduplicateByTitle(raw);
   const recentPublished = collectRecentPublishedItems(current);
-  const freshItems = filterItemsAlreadyPublished(deduped, recentPublished).slice(0, 5);
+  const freshItems = filterItemsAlreadyPublished(deduped, recentPublished);
 
   if (freshItems.length === 0) {
     console.log(`[daily-brew] skipped ${lang}: no fresh RSS items in ${NO_REPEAT_WINDOW_DAYS} days`);
     return;
   }
 
-  const items = await generateShortTitles(lang, freshItems, env);
+  const generatedItems = await generateShortTitles(
+    lang,
+    freshItems.slice(0, GEMINI_CANDIDATE_LIMIT),
+    env,
+  );
+  const items = deduplicateByShortTitle(generatedItems).slice(0, OUTPUT_ITEM_LIMIT);
 
   if (items.length === 0) {
     console.log(`[daily-brew] skipped ${lang}: Gemini returned no items`);
@@ -321,6 +328,22 @@ function deduplicateByTitle(items: RssItem[]): RssItem[] {
     if (!isDuplicate) {
       result.push(item);
     }
+  }
+
+  return result;
+}
+
+function deduplicateByShortTitle(items: NewsItem[]): NewsItem[] {
+  const seen = new Set<string>();
+  const result: NewsItem[] = [];
+
+  for (const item of items) {
+    const normalizedShortTitle = normalizeTitle(item.short_title);
+    if (!normalizedShortTitle || seen.has(normalizedShortTitle)) {
+      continue;
+    }
+    seen.add(normalizedShortTitle);
+    result.push(item);
   }
 
   return result;
