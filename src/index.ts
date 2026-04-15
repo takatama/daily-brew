@@ -62,6 +62,14 @@ const BLOCKED_SOURCES = [
   'paypayfleamarket.yahoo.co.jp',
 ];
 
+const PRIORITY_SOURCES = [
+  'note',
+  'note.com',
+  'gigazine',
+  '家電 watch',
+  'kaden.watch.impress.co.jp',
+];
+
 // クエリにコーヒー文化・技術系ワードを使い、プレスリリース・地域紙サイトを -site: で除外
 const RSS_URLS: Record<Lang, string> = {
   ja: 'https://news.google.com/rss/search?q=(%E3%83%8F%E3%83%B3%E3%83%89%E3%83%89%E3%83%AA%E3%83%83%E3%83%97%20OR%20%E3%82%B3%E3%83%BC%E3%83%92%E3%83%BC%E6%8A%BD%E5%87%BA%20OR%20%E3%82%B9%E3%83%9A%E3%82%B7%E3%83%A3%E3%83%AB%E3%83%86%E3%82%A3%E3%82%B3%E3%83%BC%E3%83%92%E3%83%BC%20OR%20%E3%82%B3%E3%83%BC%E3%83%92%E3%83%BC%E7%84%99%E7%85%8E%20OR%20%E3%83%90%E3%83%AA%E3%82%B9%E3%82%BF)%20-site%3Aprtimes.jp%20-site%3Aatpress.ne.jp%20-site%3Anewscast.co.jp%20-site%3Akeizaishimbun.co.jp%20-site%3Apaypayfleamarket.yahoo.co.jp&hl=ja&gl=JP&ceid=JP:ja',
@@ -314,7 +322,20 @@ async function fetchRssItems(lang: Lang, count: number): Promise<RssItem[]> {
           item.source.toLowerCase().includes(blocked.toLowerCase()),
         ),
     )
+    .sort(
+      (a, b) =>
+        sourcePriorityScore(b.source) - sourcePriorityScore(a.source),
+    )
     .slice(0, count);
+}
+
+function sourcePriorityScore(source: string): number {
+  const normalized = source.toLowerCase();
+  return PRIORITY_SOURCES.reduce(
+    (score, keyword) =>
+      normalized.includes(keyword.toLowerCase()) ? score + 1 : score,
+    0,
+  );
 }
 
 function deduplicateByTitle(items: RssItem[]): RssItem[] {
