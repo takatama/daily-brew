@@ -43,8 +43,8 @@ const GEMINI_CANDIDATE_LIMIT = 20;
 const OUTPUT_ITEM_LIMIT = 5;
 const NO_REPEAT_WINDOW_DAYS = 5;
 
-// PR・プレスリリース系・新聞・タウン情報など編集記事でないソースを除外（クエリの -site: で弾けなかった場合の二重安全網）
-const BLOCKED_SOURCES = [
+// RSS取得後に source 名で除外するキーワード（-site で表現しづらい媒体名・表記ゆれ向けの安全網）
+const BLOCKED_SOURCE_KEYWORDS = [
   'PR TIMES',
   'PRtimes',
   'prtimes',
@@ -56,6 +56,7 @@ const BLOCKED_SOURCES = [
   'GlobeNewswire',
   'EIN Presswire',
   '新聞',       // 釧路新聞電子版 等の地域紙
+  '新報',       // 秋田魁新報社 等の地方紙
   'タウン情報',  // あきたタウン情報 等
   'ジャーナル',  // 肥後ジャーナル 等の地域ジャーナル
   'Yahoo!フリマ',
@@ -70,11 +71,42 @@ const PRIORITY_SOURCES = [
   'kaden.watch.impress.co.jp',
 ];
 
-// クエリにコーヒー文化・技術系ワードを使い、プレスリリース・地域紙サイトを -site: で除外
-const RSS_URLS: Record<Lang, string> = {
-  ja: 'https://news.google.com/rss/search?q=(%E3%83%8F%E3%83%B3%E3%83%89%E3%83%89%E3%83%AA%E3%83%83%E3%83%97%20OR%20%E3%82%B3%E3%83%BC%E3%83%92%E3%83%BC%E6%8A%BD%E5%87%BA%20OR%20%E3%82%B9%E3%83%9A%E3%82%B7%E3%83%A3%E3%83%AB%E3%83%86%E3%82%A3%E3%82%B3%E3%83%BC%E3%83%92%E3%83%BC%20OR%20%E3%82%B3%E3%83%BC%E3%83%92%E3%83%BC%E7%84%99%E7%85%8E%20OR%20%E3%83%90%E3%83%AA%E3%82%B9%E3%82%BF)%20-site%3Aprtimes.jp%20-site%3Aatpress.ne.jp%20-site%3Anewscast.co.jp%20-site%3Akeizaishimbun.co.jp%20-site%3Apaypayfleamarket.yahoo.co.jp&hl=ja&gl=JP&ceid=JP:ja',
-  en: 'https://news.google.com/rss/search?q=(pour%20over%20coffee%20OR%20home%20espresso%20OR%20specialty%20coffee%20OR%20coffee%20roasting%20OR%20barista)%20-site%3Abusinesswire.com%20-site%3Aprnewswire.com%20-site%3Aglobenewswire.com&hl=en&gl=US&ceid=US:en',
+// Google News query 側での除外対象（ドメインで明確に指定できるもの）
+const QUERY_EXCLUDED_SITES: Record<Lang, string[]> = {
+  ja: [
+    'prtimes.jp',
+    'atpress.ne.jp',
+    'newscast.co.jp',
+    'keizaishimbun.co.jp',
+    'paypayfleamarket.yahoo.co.jp',
+  ],
+  en: [
+    'businesswire.com',
+    'prnewswire.com',
+    'globenewswire.com',
+  ],
 };
+
+const QUERY_TOPIC_TERMS: Record<Lang, string[]> = {
+  ja: ['ハンドドリップ', 'コーヒー抽出', 'スペシャルティコーヒー', 'コーヒー焙煎', 'バリスタ'],
+  en: ['pour over coffee', 'home espresso', 'specialty coffee', 'coffee roasting', 'barista'],
+};
+
+function buildGoogleNewsRssUrl(lang: Lang): string {
+  const topicClause = `(${QUERY_TOPIC_TERMS[lang].join(' OR ')})`;
+  const excludedSitesClause = QUERY_EXCLUDED_SITES[lang]
+    .map((site) => `-site:${site}`)
+    .join(' ');
+  const query = `${topicClause} ${excludedSitesClause}`.trim();
+
+  const params = new URLSearchParams({
+    q: query,
+    hl: lang,
+    gl: lang === 'ja' ? 'JP' : 'US',
+    ceid: lang === 'ja' ? 'JP:ja' : 'US:en',
+  });
+  return `https://news.google.com/rss/search?${params.toString()}`;
+}
 
 export default {
   async fetch(
@@ -265,7 +297,7 @@ function pruneRecentPublishedItems(
 }
 
 async function fetchRssItems(lang: Lang, count: number): Promise<RssItem[]> {
-  const response = await fetch(RSS_URLS[lang], {
+  const response = await fetch(buildGoogleNewsRssUrl(lang), {
     headers: { 'User-Agent': 'daily-brew/1.0' },
   });
 
@@ -318,7 +350,7 @@ async function fetchRssItems(lang: Lang, count: number): Promise<RssItem[]> {
       (item) =>
         item.title &&
         item.url &&
-        !BLOCKED_SOURCES.some((blocked) =>
+        !BLOCKED_SOURCE_KEYWORDS.some((blocked) =>
           item.source.toLowerCase().includes(blocked.toLowerCase()),
         ),
     )
