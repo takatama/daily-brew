@@ -42,6 +42,7 @@ const RSS_CANDIDATE_LIMIT = 100;
 const GEMINI_CANDIDATE_LIMIT = 20;
 const OUTPUT_ITEM_LIMIT = 5;
 const NO_REPEAT_WINDOW_DAYS = 5;
+const RSS_LOOKBACK_MONTHS = 3;
 
 // RSS取得後に source 名で除外するキーワード（-site で表現しづらい媒体名・表記ゆれ向けの安全網）
 const BLOCKED_SOURCE_KEYWORDS = [
@@ -97,7 +98,7 @@ function buildGoogleNewsRssUrl(lang: Lang): string {
   const excludedSitesClause = QUERY_EXCLUDED_SITES[lang]
     .map((site) => `-site:${site}`)
     .join(' ');
-  const query = `${topicClause} ${excludedSitesClause}`.trim();
+  const query = `${topicClause} ${excludedSitesClause} when:${RSS_LOOKBACK_MONTHS}m`.trim();
 
   const params = new URLSearchParams({
     q: query,
@@ -330,7 +331,7 @@ async function fetchRssItems(lang: Lang, count: number): Promise<RssItem[]> {
     return m ? m[1].trim() : '';
   }
 
-  return itemBlocks
+  const items = itemBlocks
     .map(([, block]) => {
       const title = extractTag(block, 'title');
       const link = extractTag(block, 'link');
@@ -358,7 +359,21 @@ async function fetchRssItems(lang: Lang, count: number): Promise<RssItem[]> {
       (a, b) =>
         sourcePriorityScore(b.source) - sourcePriorityScore(a.source),
     )
-    .slice(0, count);
+    .slice(0, count * 2);
+
+  return filterItemsByPublishedAtWindow(items, RSS_LOOKBACK_MONTHS).slice(0, count);
+}
+
+
+function filterItemsByPublishedAtWindow(items: RssItem[], months: number): RssItem[] {
+  const cutoff = new Date();
+  cutoff.setMonth(cutoff.getMonth() - months);
+
+  return items.filter((item) => {
+    if (!item.publishedAt) return false;
+    const publishedTime = new Date(item.publishedAt).getTime();
+    return Number.isFinite(publishedTime) && publishedTime >= cutoff.getTime();
+  });
 }
 
 function sourcePriorityScore(source: string): number {
