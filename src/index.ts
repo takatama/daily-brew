@@ -98,7 +98,7 @@ function buildGoogleNewsRssUrl(lang: Lang): string {
   const excludedSitesClause = QUERY_EXCLUDED_SITES[lang]
     .map((site) => `-site:${site}`)
     .join(' ');
-  const query = `${topicClause} ${excludedSitesClause} when:${RSS_LOOKBACK_MONTHS}m`.trim();
+  const query = `${topicClause} ${excludedSitesClause}`.trim();
 
   const params = new URLSearchParams({
     q: query,
