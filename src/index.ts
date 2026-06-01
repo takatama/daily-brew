@@ -590,7 +590,15 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
-function isAllowedOrigin(origin: string, allowed: string): boolean {
+function isAllowedOrigin(origin: string, allowedOrigins: string): boolean {
+  return allowedOrigins
+    .split(',')
+    .map((allowed) => allowed.trim())
+    .filter(Boolean)
+    .some((allowed) => isOriginMatch(origin, allowed));
+}
+
+function isOriginMatch(origin: string, allowed: string): boolean {
   if (origin === allowed) return true;
   try {
     const o = new URL(origin);
