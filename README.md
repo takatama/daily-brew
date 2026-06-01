@@ -39,7 +39,7 @@
 
 ### CORS
 
-- `Access-Control-Allow-Origin` is set when the request `Origin` matches `ALLOWED_ORIGIN` exactly or is a subdomain of it (e.g. `*.coco-timer.pages.dev`)
+- `Access-Control-Allow-Origin` is set when the request `Origin` matches one of the comma-separated `ALLOWED_ORIGIN` entries exactly or is a subdomain of one of them (e.g. `*.coco-timer.pages.dev`, `*.neo-brew-timer.pages.dev`)
 - `OPTIONS` preflight is supported
 
 ## KV Keys
@@ -98,6 +98,7 @@ Verify the response:
 ```bash
 curl -i "http://localhost:8787/news?lang=ja" -H "Origin: https://coco-timer.pages.dev"
 curl -i "http://localhost:8787/news?lang=en" -H "Origin: https://coco-timer.pages.dev"
+curl -i "http://localhost:8787/news?lang=ja" -H "Origin: https://neo-brew-timer.pages.dev"
 ```
 
 ## Manual News Refresh

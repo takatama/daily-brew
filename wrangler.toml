@@ -3,7 +3,7 @@ main = "src/index.ts"
 compatibility_date = "2026-02-14"
 
 [vars]
-ALLOWED_ORIGIN = "https://coco-timer.pages.dev"
+ALLOWED_ORIGIN = "https://coco-timer.pages.dev,https://neo-brew-timer.pages.dev"
 
 [[kv_namespaces]]
 binding = "KV_DAILY_BREW"
