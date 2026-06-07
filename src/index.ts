@@ -65,8 +65,6 @@ const BLOCKED_SOURCE_KEYWORDS = [
 ];
 
 const PRIORITY_SOURCES = [
-  'note',
-  'note.com',
   'gigazine',
   '家電 watch',
   'kaden.watch.impress.co.jp',
