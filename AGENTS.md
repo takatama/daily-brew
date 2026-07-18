@@ -9,26 +9,28 @@ Guidelines for AI agents (Claude Code, Codex, etc.) working on this repository.
 ## Architecture
 
 - **Runtime**: Cloudflare Workers (single file: `src/index.ts`)
-- **KV binding**: `KV_DAILY_BREW` — key pattern: `daily-brew:current:{lang}`
-- **Cron**: `0 22 * * *` UTC (07:00 JST), runs for both `ja` and `en`
+- **KV binding**: `KV_DAILY_BREW` — key patterns: `daily-brew:current:{lang}`, `daily-brew:status:{lang}`
+- **Cron**: `0 20 * * *` UTC (05:00 JST), runs for both `ja` and `en`
 - **Gemini model**: `gemini-2.5-flash-lite` — no `google_search` tool (causes URL hallucination)
 
 ## Scheduled Flow
 
 ```
 for lang in ['ja', 'en']:
-  1. fetchRssItems(lang, 20)       — Google News RSS, regex XML parse
-  2. deduplicateByTitle(items)     — Jaccard similarity > 0.6 → remove duplicate
-  3. .slice(0, 5)
-  4. generateSummaries(lang, items) — Gemini: short_title + summary as JSON
-  5. KV.put('daily-brew:current:{lang}', items[0])
+  1. fetchRssItems(lang, 100)        — Google News RSS, regex XML parse, source/date filters
+  2. deduplicateByTitle(items)      — Jaccard similarity > 0.6 → remove duplicate
+  3. filterItemsAlreadyPublished()  — 5-day no-repeat filter
+  4. .slice(0, 20)
+  5. generateShortTitles(lang, items) — Gemini: short_title as JSON
+  6. KV.put('daily-brew:current:{lang}', up to 5 items)
+  7. KV.put('daily-brew:status:{lang}', run result and counts)
 ```
 
 ## Key Constraints
 
 - **No DOMParser**: Cloudflare Workers does not support `DOMParser`. Parse XML with regex.
 - **No `google_search` tool in Gemini**: Use `responseMimeType: 'application/json'` only; adding `tools: [{ google_search: {} }]` prevents JSON mode and causes URL fabrication.
-- **Blocked sources**: Press-release distributors are filtered in `BLOCKED_SOURCES` (PR TIMES, atpress, newscast, Business Wire, PR Newswire, GlobeNewswire, EIN Presswire). Add to the array as needed.
+- **Blocked sources**: Press-release distributors and individually listed low-relevance sources are filtered in `BLOCKED_SOURCE_KEYWORDS` (PR TIMES, atpress, newscast, Business Wire, PR Newswire, GlobeNewswire, EIN Presswire, Yahoo!フリマ, etc.). Add broad news publishers only by full source name when needed.
 - **Type check**: Always run `npx tsc --noEmit` before committing.
 
 ## Local Development
@@ -44,6 +46,7 @@ curl "http://localhost:8787/cdn-cgi/handler/scheduled"
 
 # Verify response
 curl -i "http://localhost:8787/news?lang=ja" -H "Origin: https://coco-timer.pages.dev"
+curl -i "http://localhost:8787/status"
 ```
 
 ## PR Guidelines

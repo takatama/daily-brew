@@ -36,6 +36,33 @@ type CurrentPayload = {
   recentPublished?: RecentPublishedItem[];
 };
 
+type RunResult =
+  | 'updated'
+  | 'skipped_no_fresh'
+  | 'skipped_gemini_empty'
+  | 'rss_failed'
+  | 'error';
+
+type RunStatus = {
+  lang: Lang;
+  runAt: string;
+  result: RunResult;
+  counts: {
+    rssFetched: number;
+    afterDedup: number;
+    afterNoRepeat: number;
+    geminiReturned: number;
+    published: number;
+  };
+  errorMessage?: string;
+};
+
+type RssFetchResult = {
+  ok: boolean;
+  items: RssItem[];
+  errorMessage?: string;
+};
+
 const KEY_PREFIX = 'daily-brew';
 const GEMINI_MODEL = 'gemini-2.5-flash-lite';
 const RSS_CANDIDATE_LIMIT = 100;
@@ -44,7 +71,7 @@ const OUTPUT_ITEM_LIMIT = 5;
 const NO_REPEAT_WINDOW_DAYS = 5;
 const RSS_LOOKBACK_MONTHS = 3;
 
-// RSS取得後に source 名で除外するキーワード（-site で表現しづらい媒体名・表記ゆれ向けの安全網）
+// RSS取得後に source 名で除外するキーワード（プレスリリース配信元や個別に確認した低関連媒体の安全網）
 const BLOCKED_SOURCE_KEYWORDS = [
   'PR TIMES',
   'PRtimes',
@@ -56,10 +83,10 @@ const BLOCKED_SOURCE_KEYWORDS = [
   'PR Newswire',
   'GlobeNewswire',
   'EIN Presswire',
-  '新聞',       // 釧路新聞電子版 等の地域紙
-  '新報',       // 秋田魁新報社 等の地方紙
-  'タウン情報',  // あきたタウン情報 等
-  'ジャーナル',  // 肥後ジャーナル 等の地域ジャーナル
+  '釧路新聞',
+  '秋田魁新報',
+  'あきたタウン情報',
+  '肥後ジャーナル',
   'Yahoo!フリマ',
   'paypayfleamarket.yahoo.co.jp',
 ];
@@ -129,6 +156,11 @@ export default {
       return buildCorsResponse(response, request, env);
     }
 
+    if (request.method === 'GET' && url.pathname === '/status') {
+      const response = await handleGetStatus(env);
+      return buildCorsResponse(response, request, env);
+    }
+
     return buildCorsResponse(
       jsonResponse({ error: 'Not Found' }, 404),
       request,
@@ -145,10 +177,18 @@ export default {
       try {
         await refreshLanguageNews(lang, env);
       } catch (error) {
+        const errorMessage = getErrorMessage(error);
         console.error(
           `[daily-brew] scheduled refresh failed for ${lang}`,
-          error instanceof Error ? error.message : String(error),
+          errorMessage,
         );
+        await writeRunStatus(env, {
+          lang,
+          runAt: new Date().toISOString(),
+          result: 'error',
+          counts: emptyRunCounts(),
+          errorMessage,
+        });
       }
     }
   },
@@ -169,51 +209,114 @@ async function handleGetNews(
   return new Response(null, { status: 204 });
 }
 
+async function handleGetStatus(env: Env): Promise<Response> {
+  const [ja, en] = await Promise.all(
+    (['ja', 'en'] as Lang[]).map((lang) =>
+      env.KV_DAILY_BREW.get<RunStatus>(kvKey('status', lang), 'json'),
+    ),
+  );
+
+  return jsonResponse({ ja, en }, 200);
+}
+
 async function refreshLanguageNews(lang: Lang, env: Env): Promise<void> {
-  const current = await env.KV_DAILY_BREW.get<CurrentPayload>(
-    kvKey('current', lang),
-    'json',
-  );
-  const raw = await fetchRssItems(lang, RSS_CANDIDATE_LIMIT);
-  const deduped = deduplicateByTitle(raw);
-  const recentPublished = collectRecentPublishedItems(current);
-  const freshItems = filterItemsAlreadyPublished(deduped, recentPublished);
+  const runAt = new Date().toISOString();
+  const counts = emptyRunCounts();
 
-  if (freshItems.length === 0) {
-    console.log(`[daily-brew] skipped ${lang}: no fresh RSS items in ${NO_REPEAT_WINDOW_DAYS} days`);
-    return;
-  }
+  try {
+    const current = await env.KV_DAILY_BREW.get<CurrentPayload>(
+      kvKey('current', lang),
+      'json',
+    );
+    const rssResult = await fetchRssItems(lang, RSS_CANDIDATE_LIMIT);
+    counts.rssFetched = rssResult.items.length;
 
-  const generatedItems = await generateShortTitles(
-    lang,
-    freshItems.slice(0, GEMINI_CANDIDATE_LIMIT),
-    env,
-  );
-  const items = deduplicateByShortTitle(generatedItems).slice(0, OUTPUT_ITEM_LIMIT);
+    if (!rssResult.ok) {
+      const status = {
+        lang,
+        runAt,
+        result: 'rss_failed',
+        counts,
+        errorMessage: rssResult.errorMessage,
+      } satisfies RunStatus;
+      console.error(`[daily-brew] skipped ${lang}: ${rssResult.errorMessage}`);
+      await writeRunStatus(env, status);
+      return;
+    }
 
-  if (items.length === 0) {
-    console.log(`[daily-brew] skipped ${lang}: Gemini returned no items`);
-    return;
-  }
+    const deduped = deduplicateByTitle(rssResult.items);
+    counts.afterDedup = deduped.length;
+    const recentPublished = collectRecentPublishedItems(current);
+    const freshItems = filterItemsAlreadyPublished(deduped, recentPublished);
+    counts.afterNoRepeat = freshItems.length;
 
-  const generatedAt = new Date().toISOString();
-  const updatedRecentPublished = buildRecentPublishedItems(
-    recentPublished,
-    items,
-    generatedAt,
-  );
+    if (freshItems.length === 0) {
+      console.log(`[daily-brew] skipped ${lang}: no fresh RSS items in ${NO_REPEAT_WINDOW_DAYS} days`);
+      await writeRunStatus(env, {
+        lang,
+        runAt,
+        result: 'skipped_no_fresh',
+        counts,
+      });
+      return;
+    }
 
-  await env.KV_DAILY_BREW.put(
-    kvKey('current', lang),
-    JSON.stringify({
+    const generatedItems = await generateShortTitles(
       lang,
-      generatedAt,
-      items,
-      recentPublished: updatedRecentPublished,
-    }),
-  );
+      freshItems.slice(0, GEMINI_CANDIDATE_LIMIT),
+      env,
+    );
+    counts.geminiReturned = generatedItems.length;
+    const items = deduplicateByShortTitle(generatedItems).slice(0, OUTPUT_ITEM_LIMIT);
+    counts.published = items.length;
 
-  console.log(`[daily-brew] updated ${lang}: ${items.length} items`);
+    if (items.length === 0) {
+      console.log(`[daily-brew] skipped ${lang}: Gemini returned no items`);
+      await writeRunStatus(env, {
+        lang,
+        runAt,
+        result: 'skipped_gemini_empty',
+        counts,
+      });
+      return;
+    }
+
+    const generatedAt = new Date().toISOString();
+    const updatedRecentPublished = buildRecentPublishedItems(
+      recentPublished,
+      items,
+      generatedAt,
+    );
+
+    await env.KV_DAILY_BREW.put(
+      kvKey('current', lang),
+      JSON.stringify({
+        lang,
+        generatedAt,
+        items,
+        recentPublished: updatedRecentPublished,
+      }),
+    );
+
+    await writeRunStatus(env, {
+      lang,
+      runAt,
+      result: 'updated',
+      counts,
+    });
+
+    console.log(`[daily-brew] updated ${lang}: ${items.length} items`);
+  } catch (error) {
+    const errorMessage = getErrorMessage(error);
+    console.error(`[daily-brew] refresh failed for ${lang}`, errorMessage);
+    await writeRunStatus(env, {
+      lang,
+      runAt,
+      result: 'error',
+      counts,
+      errorMessage,
+    });
+  }
 }
 
 function collectRecentPublishedItems(
@@ -295,16 +398,15 @@ function pruneRecentPublishedItems(
     });
 }
 
-async function fetchRssItems(lang: Lang, count: number): Promise<RssItem[]> {
+async function fetchRssItems(lang: Lang, count: number): Promise<RssFetchResult> {
   const response = await fetch(buildGoogleNewsRssUrl(lang), {
     headers: { 'User-Agent': 'daily-brew/1.0' },
   });
 
   if (!response.ok) {
-    console.error(
-      `[daily-brew] RSS fetch failed for ${lang}: ${response.status}`,
-    );
-    return [];
+    const errorMessage = `RSS fetch failed with HTTP ${response.status}`;
+    console.error(`[daily-brew] ${errorMessage} for ${lang}`);
+    return { ok: false, items: [], errorMessage };
   }
 
   const xml = await response.text();
@@ -359,7 +461,10 @@ async function fetchRssItems(lang: Lang, count: number): Promise<RssItem[]> {
     )
     .slice(0, count * 2);
 
-  return filterItemsByPublishedAtWindow(items, RSS_LOOKBACK_MONTHS).slice(0, count);
+  return {
+    ok: true,
+    items: filterItemsByPublishedAtWindow(items, RSS_LOOKBACK_MONTHS).slice(0, count),
+  };
 }
 
 
@@ -540,7 +645,7 @@ function normalizeLang(value: string | null): Lang {
   return value === 'en' ? 'en' : 'ja';
 }
 
-function kvKey(type: 'current', lang: Lang): string {
+function kvKey(type: 'current' | 'status', lang: Lang): string {
   return `${KEY_PREFIX}:${type}:${lang}`;
 }
 
@@ -577,6 +682,34 @@ function hashString(input: string): string {
     hash = (hash * 33) ^ input.charCodeAt(i);
   }
   return `n_${(hash >>> 0).toString(16)}`;
+}
+
+function emptyRunCounts(): RunStatus['counts'] {
+  return {
+    rssFetched: 0,
+    afterDedup: 0,
+    afterNoRepeat: 0,
+    geminiReturned: 0,
+    published: 0,
+  };
+}
+
+async function writeRunStatus(env: Env, status: RunStatus): Promise<void> {
+  try {
+    await env.KV_DAILY_BREW.put(
+      kvKey('status', status.lang),
+      JSON.stringify(status),
+    );
+  } catch (error) {
+    console.error(
+      `[daily-brew] failed to write status for ${status.lang}`,
+      getErrorMessage(error),
+    );
+  }
+}
+
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function jsonResponse(body: unknown, status = 200): Response {
