@@ -1,12 +1,12 @@
 # daily-brew
 
-`daily-brew` is a Cloudflare Worker API that delivers up to 5 coffee-related news items per language per day. It fetches articles from Google News RSS, deduplicates by title similarity, and uses Gemini 2.5-flash-lite to generate a `short_title` for each item. Results are cached in Workers KV and served from `GET /news`.
+`daily-brew` is a Cloudflare Worker API that delivers up to 5 coffee-related news items per language per day. It fetches articles from Google News RSS, deduplicates by title similarity, and uses Gemini 2.5-flash-lite to generate a `short_title` for each item. Results are cached in Workers KV and served from `GET /news`. Scheduled run results are exposed from `GET /status`.
 
 ## Key Features
 
 - Google News RSS (up to 100 candidates) → Jaccard-based deduplication → 5-day no-repeat filtering → Gemini `short_title` generation
 - `ja` and `en` use independent RSS queries (not translation)
-- Press-release sources (PR TIMES, atpress, newscast, 経済新聞, etc.) are filtered out at the query and source level
+- Press-release sources (PR TIMES, atpress, newscast, Business Wire, etc.), Yahoo!フリマ, and individually listed low-relevance sources are filtered out at the query and source level
 - Gemini API key is kept server-side as a Worker secret and never exposed to clients
 
 ## API
@@ -37,6 +37,31 @@
 }
 ```
 
+
+### `GET /status`
+
+Returns the latest scheduled-run status for both languages. This endpoint does not require authentication and intentionally contains only result metadata and counts.
+
+```json
+{
+  "ja": {
+    "lang": "ja",
+    "runAt": "2026-03-01T20:00:00.000Z",
+    "result": "updated",
+    "counts": {
+      "rssFetched": 42,
+      "afterDedup": 37,
+      "afterNoRepeat": 35,
+      "geminiReturned": 20,
+      "published": 5
+    }
+  },
+  "en": null
+}
+```
+
+`result` is one of `updated`, `skipped_no_fresh`, `skipped_gemini_empty`, `rss_failed`, or `error`.
+
 ### CORS
 
 - `Access-Control-Allow-Origin` is set when the request `Origin` matches one of the comma-separated `ALLOWED_ORIGIN` entries exactly or is a subdomain of one of them (e.g. `*.coco-timer.pages.dev`, `*.neo-brew-timer.pages.dev`)
@@ -46,6 +71,8 @@
 
 - `daily-brew:current:ja`
 - `daily-brew:current:en`
+- `daily-brew:status:ja`
+- `daily-brew:status:en`
 
 ## Scheduled Flow (Cron: `0 20 * * *` UTC = 05:00 JST)
 
@@ -54,14 +81,15 @@ For each language (`ja`, `en`):
 1. Fetch up to 100 items from Google News RSS
 2. Remove near-duplicates (Jaccard similarity > 0.6)
 3. Exclude items that were already published in the last 5 days (URL/title normalized match)
-4. Take up to 5 fresh items and pass titles to Gemini 2.5-flash-lite → receive `short_title` as JSON
-5. Store `{ lang, generatedAt, items, recentPublished }` in `daily-brew:current:{lang}`
+4. Take up to 20 fresh items and pass titles to Gemini 2.5-flash-lite → receive `short_title` as JSON
+5. Store up to 5 generated items in `daily-brew:current:{lang}`
+6. Store the run result and per-stage counts in `daily-brew:status:{lang}`
 
 ## Freshness / No-Repeat Rule
 
 - The Worker keeps a rolling 5-day publication history per language in the same KV payload (`recentPublished`).
 - A candidate is excluded if its normalized URL or normalized title matches a previously published entry within that 5-day window.
-- If no fresh items remain after filtering, the scheduled run skips updating KV and keeps the previous payload.
+- If no fresh items remain after filtering, the scheduled run skips updating current news KV, keeps the previous payload, and records `skipped_no_fresh` in status KV.
 
 ## Setup
 
@@ -71,7 +99,7 @@ npx wrangler kv namespace create KV_DAILY_BREW
 npx wrangler secret put GEMINI_API_KEY
 ```
 
-Replace the KV namespace ID in `wrangler.toml`.
+Replace the KV namespace ID in `wrangler.toml`. Workers Logs are enabled through `[observability] enabled = true`, so scheduled-run logs are retained in Cloudflare.
 
 ## Local Development
 
@@ -99,6 +127,7 @@ Verify the response:
 curl -i "http://localhost:8787/news?lang=ja" -H "Origin: https://coco-timer.pages.dev"
 curl -i "http://localhost:8787/news?lang=en" -H "Origin: https://coco-timer.pages.dev"
 curl -i "http://localhost:8787/news?lang=ja" -H "Origin: https://neo-brew-timer.pages.dev"
+curl -i "http://localhost:8787/status"
 ```
 
 ## Manual News Refresh
