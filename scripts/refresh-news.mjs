@@ -34,6 +34,10 @@ if (!process.env.GEMINI_API_KEY) {
 const KV_BINDING = 'KV_DAILY_BREW';  // binding name in wrangler.toml
 const GEMINI_MODEL = 'gemini-2.5-flash-lite';
 const KEY_PREFIX = 'daily-brew';
+const RSS_CANDIDATE_LIMIT = 100;
+const GEMINI_CANDIDATE_LIMIT = 20;
+const OUTPUT_ITEM_LIMIT = 5;
+const NO_REPEAT_WINDOW_DAYS = 5;
 
 const BLOCKED_SOURCES = [
   'PR TIMES', 'PRtimes', 'prtimes',
@@ -65,6 +69,10 @@ function extractAttr(block, tag, attr) {
 
 function normalizeTitle(title) {
   return title.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function normalizeUrl(url) {
+  return url.trim().toLowerCase().replace(/\/$/, '');
 }
 
 function tokenize(title) {
@@ -167,30 +175,129 @@ async function generateShortTitles(lang, items) {
     .filter(Boolean);
 }
 
-function writeToKV(lang, items) {
-  const key = `${KEY_PREFIX}:current:${lang}`;
-  const value = JSON.stringify({ lang, generatedAt: new Date().toISOString(), items });
+function cleanWranglerEnv() {
   // Strip CLOUDFLARE_API_TOKEN so wrangler uses its own auth (wrangler login)
   // instead of a potentially stale token loaded from .dev.vars
   const { CLOUDFLARE_API_TOKEN: _removed, ...cleanEnv } = process.env;
+  return cleanEnv;
+}
+
+function readCurrentFromKV(lang) {
+  const key = `${KEY_PREFIX}:current:${lang}`;
+
+  try {
+    const value = execFileSync(
+      'npx',
+      ['wrangler', 'kv', 'key', 'get', '--binding', KV_BINDING, '--remote', '--text', key],
+      {
+        env: cleanWranglerEnv(),
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      }
+    ).trim();
+
+    if (!value) return null;
+    return JSON.parse(value);
+  } catch (error) {
+    console.warn(`[${lang}] could not read current KV payload; continuing without recentPublished (${error.message})`);
+    return null;
+  }
+}
+
+function collectRecentPublishedItems(current) {
+  if (!current) return [];
+
+  const seeded = Array.isArray(current.items)
+    ? current.items.map(item => ({
+        url: item.url,
+        title: item.title,
+        generatedAt: item.generatedAt || current.generatedAt,
+      }))
+    : [];
+
+  return pruneRecentPublishedItems([...(current.recentPublished ?? []), ...seeded]);
+}
+
+function filterItemsAlreadyPublished(items, recentPublished) {
+  if (recentPublished.length === 0) return items;
+
+  const previousUrls = new Set(
+    recentPublished.map(item => normalizeUrl(item.url ?? '')).filter(Boolean)
+  );
+  const previousTitles = new Set(
+    recentPublished.map(item => normalizeTitle(item.title ?? '')).filter(Boolean)
+  );
+
+  return items.filter(item => {
+    const normalizedUrl = normalizeUrl(item.url);
+    const normalizedTitle = normalizeTitle(item.title);
+    return !previousUrls.has(normalizedUrl) && !previousTitles.has(normalizedTitle);
+  });
+}
+
+function buildRecentPublishedItems(previousItems, latestItems, generatedAt) {
+  const combined = [
+    ...previousItems,
+    ...latestItems.map(item => ({
+      url: item.url,
+      title: item.title,
+      generatedAt,
+    })),
+  ];
+
+  return pruneRecentPublishedItems(combined);
+}
+
+function pruneRecentPublishedItems(items) {
+  const cutoffTime = Date.now() - NO_REPEAT_WINDOW_DAYS * 24 * 60 * 60 * 1000;
+  const seen = new Set();
+
+  return items
+    .filter(item => {
+      const timestamp = new Date(item.generatedAt).getTime();
+      return Number.isFinite(timestamp) && timestamp >= cutoffTime;
+    })
+    .sort((a, b) => new Date(a.generatedAt).getTime() - new Date(b.generatedAt).getTime())
+    .filter(item => {
+      const normalizedUrl = normalizeUrl(item.url ?? '');
+      const normalizedTitle = normalizeTitle(item.title ?? '');
+      const fingerprint = `${normalizedUrl}::${normalizedTitle}`;
+      if (!normalizedUrl && !normalizedTitle) return false;
+      if (seen.has(fingerprint)) return false;
+      seen.add(fingerprint);
+      return true;
+    });
+}
+
+function writeToKV(lang, items, recentPublished) {
+  const key = `${KEY_PREFIX}:current:${lang}`;
+  const generatedAt = new Date().toISOString();
+  const value = JSON.stringify({ lang, generatedAt, items, recentPublished });
   execFileSync('npx', ['wrangler', 'kv', 'key', 'put', '--binding', KV_BINDING, '--remote', key, value], {
-    env: cleanEnv,
+    env: cleanWranglerEnv(),
     stdio: 'inherit',
   });
 }
 
 async function refresh(lang) {
   console.log(`[${lang}] fetching RSS...`);
-  const raw = await fetchRssItems(lang, 20);
-  const deduped = deduplicateByTitle(raw).slice(0, 5);
-  if (deduped.length === 0) { console.log(`[${lang}] no items after dedup, skipped`); return; }
+  const current = readCurrentFromKV(lang);
+  const raw = await fetchRssItems(lang, RSS_CANDIDATE_LIMIT);
+  const deduped = deduplicateByTitle(raw);
+  const recentPublished = collectRecentPublishedItems(current);
+  const freshItems = filterItemsAlreadyPublished(deduped, recentPublished);
+  const candidates = freshItems.slice(0, GEMINI_CANDIDATE_LIMIT);
+  if (candidates.length === 0) { console.log(`[${lang}] no fresh items after recentPublished filter, skipped`); return; }
 
-  console.log(`[${lang}] generating short_titles for ${deduped.length} items...`);
-  const items = await generateShortTitles(lang, deduped);
+  console.log(`[${lang}] generating short_titles for ${candidates.length} items...`);
+  const items = (await generateShortTitles(lang, candidates)).slice(0, OUTPUT_ITEM_LIMIT);
   if (items.length === 0) { console.log(`[${lang}] Gemini returned no items, skipped`); return; }
 
+  const generatedAt = new Date().toISOString();
+  const updatedRecentPublished = buildRecentPublishedItems(recentPublished, items, generatedAt);
+
   console.log(`[${lang}] writing ${items.length} items to KV...`);
-  await writeToKV(lang, items);
+  await writeToKV(lang, items, updatedRecentPublished);
   console.log(`[${lang}] done: ${items.map(i => i.short_title).join(' / ')}`);
 }
 
