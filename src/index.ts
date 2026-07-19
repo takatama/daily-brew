@@ -219,7 +219,7 @@ async function handleGetStatus(env: Env): Promise<Response> {
   return jsonResponse({ ja, en }, 200);
 }
 
-async function refreshLanguageNews(lang: Lang, env: Env): Promise<void> {
+export async function refreshLanguageNews(lang: Lang, env: Env): Promise<void> {
   const runAt = new Date().toISOString();
   const counts = emptyRunCounts();
 
@@ -492,11 +492,8 @@ function deduplicateByTitle(items: RssItem[]): RssItem[] {
   const result: RssItem[] = [];
 
   for (const item of items) {
-    const tokens = tokenizeTitle(normalizeTitle(item.title));
-    const isDuplicate = result.some(
-      (kept) =>
-        jaccardSimilarity(tokens, tokenizeTitle(normalizeTitle(kept.title))) >
-        0.6,
+    const isDuplicate = result.some((kept) =>
+      areTitlesSimilar(item.title, kept.title),
     );
     if (!isDuplicate) {
       result.push(item);
@@ -507,15 +504,20 @@ function deduplicateByTitle(items: RssItem[]): RssItem[] {
 }
 
 function deduplicateByShortTitle(items: NewsItem[]): NewsItem[] {
-  const seen = new Set<string>();
   const result: NewsItem[] = [];
 
   for (const item of items) {
     const normalizedShortTitle = normalizeTitle(item.short_title);
-    if (!normalizedShortTitle || seen.has(normalizedShortTitle)) {
+    const normalizedUrl = normalizeUrl(item.url);
+    const isDuplicate = result.some(
+      (kept) =>
+        (normalizedUrl && normalizedUrl === normalizeUrl(kept.url)) ||
+        areTitlesSimilar(item.title, kept.title) ||
+        areTitlesSimilar(item.short_title, kept.short_title),
+    );
+    if (!normalizedShortTitle || isDuplicate) {
       continue;
     }
-    seen.add(normalizedShortTitle);
     result.push(item);
   }
 
@@ -666,6 +668,35 @@ function tokenizeTitle(title: string): Set<string> {
   return new Set(tokens);
 }
 
+function tokenizeJapaneseTitle(title: string): Set<string> {
+  const compactTitle = title.replace(/\s+/g, '');
+  const tokens = new Set<string>();
+  for (let i = 0; i < compactTitle.length - 1; i += 1) {
+    tokens.add(compactTitle.slice(i, i + 2));
+  }
+  return tokens;
+}
+
+function areTitlesSimilar(a: string, b: string): boolean {
+  const normalizedA = normalizeTitle(a);
+  const normalizedB = normalizeTitle(b);
+  if (!normalizedA || !normalizedB) return false;
+  if (normalizedA === normalizedB) return true;
+
+  const containsJapanese = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u;
+  const tokensA = containsJapanese.test(normalizedA)
+    ? tokenizeJapaneseTitle(normalizedA)
+    : tokenizeTitle(normalizedA);
+  const tokensB = containsJapanese.test(normalizedB)
+    ? tokenizeJapaneseTitle(normalizedB)
+    : tokenizeTitle(normalizedB);
+
+  return (
+    jaccardSimilarity(tokensA, tokensB) > 0.6 ||
+    overlapSimilarity(tokensA, tokensB) > 0.5
+  );
+}
+
 function jaccardSimilarity(a: Set<string>, b: Set<string>): number {
   if (a.size === 0 || b.size === 0) return 0;
   let intersection = 0;
@@ -674,6 +705,15 @@ function jaccardSimilarity(a: Set<string>, b: Set<string>): number {
   }
   const union = new Set([...a, ...b]).size;
   return union === 0 ? 0 : intersection / union;
+}
+
+function overlapSimilarity(a: Set<string>, b: Set<string>): number {
+  if (a.size === 0 || b.size === 0) return 0;
+  let intersection = 0;
+  for (const token of a) {
+    if (b.has(token)) intersection += 1;
+  }
+  return intersection / Math.min(a.size, b.size);
 }
 
 function hashString(input: string): string {

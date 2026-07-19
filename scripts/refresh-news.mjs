@@ -1,322 +1,119 @@
 #!/usr/bin/env node
 /**
- * Fetch RSS → deduplicate → generate short_titles via Gemini → write to KV
+ * Run the Worker's refresh pipeline against the production KV namespace.
  *
  * Usage:
  *   node scripts/refresh-news.mjs          # both ja and en
  *   node scripts/refresh-news.mjs ja       # ja only
  *   node scripts/refresh-news.mjs en       # en only
- *
- * Required env vars:
- *   GEMINI_API_KEY
- *
- * KV write uses wrangler's own auth (wrangler login). No token needed.
  */
 
-import { execFileSync } from 'child_process';
+import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 
-// Load .dev.vars automatically (same file used by wrangler dev)
-try {
-  const { readFileSync } = await import('fs');
-  const devVars = readFileSync(new URL('../.dev.vars', import.meta.url), 'utf8');
-  for (const line of devVars.split('\n')) {
-    const m = line.trim().match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
-    if (!m || process.env[m[1]]) continue;
+const KV_BINDING = 'KV_DAILY_BREW';
 
-    const value = m[2].trim();
-    const quote = value[0];
-    process.env[m[1]] =
-      (quote === '"' || quote === "'") && value.endsWith(quote)
-        ? value.slice(1, -1)
-        : value;
-  }
-} catch { /* .dev.vars is optional */ }
+loadDevVars();
 
-// Validate required env vars early
 if (!process.env.GEMINI_API_KEY) {
   console.error('Missing required environment variable: GEMINI_API_KEY');
   process.exit(1);
 }
 
-const KV_BINDING = 'KV_DAILY_BREW';  // binding name in wrangler.toml
-const GEMINI_MODEL = 'gemini-2.5-flash-lite';
-const KEY_PREFIX = 'daily-brew';
-const RSS_CANDIDATE_LIMIT = 100;
-const GEMINI_CANDIDATE_LIMIT = 20;
-const OUTPUT_ITEM_LIMIT = 5;
-const NO_REPEAT_WINDOW_DAYS = 5;
+const { refreshLanguageNews } = await import('../src/index.ts');
 
-const BLOCKED_SOURCES = [
-  'PR TIMES', 'PRtimes', 'prtimes',
-  'アットプレス', 'atpress', 'newscast',
-  'Business Wire', 'PR Newswire', 'GlobeNewswire', 'EIN Presswire',
-  '新聞', 'タウン情報', 'ジャーナル',
-];
+function loadDevVars() {
+  try {
+    const devVars = readFileSync(new URL('../.dev.vars', import.meta.url), 'utf8');
+    for (const line of devVars.split('\n')) {
+      const match = line
+        .trim()
+        .match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
+      if (!match || process.env[match[1]]) continue;
 
-const RSS_URLS = {
-  ja: 'https://news.google.com/rss/search?q=(%E3%83%8F%E3%83%B3%E3%83%89%E3%83%89%E3%83%AA%E3%83%83%E3%83%97%20OR%20%E3%82%B3%E3%83%BC%E3%83%92%E3%83%BC%E6%8A%BD%E5%87%BA%20OR%20%E3%82%B9%E3%83%9A%E3%82%B7%E3%83%A3%E3%83%AB%E3%83%86%E3%82%A3%E3%82%B3%E3%83%BC%E3%83%92%E3%83%BC%20OR%20%E3%82%B3%E3%83%BC%E3%83%92%E3%83%BC%E7%84%99%E7%85%8E%20OR%20%E3%83%90%E3%83%AA%E3%82%B9%E3%82%BF)%20-site%3Aprtimes.jp%20-site%3Aatpress.ne.jp%20-site%3Anewscast.co.jp%20-site%3Akeizaishimbun.co.jp&hl=ja&gl=JP&ceid=JP:ja',
-  en: 'https://news.google.com/rss/search?q=(pour%20over%20coffee%20OR%20home%20espresso%20OR%20specialty%20coffee%20OR%20coffee%20roasting%20OR%20barista)%20-site%3Abusinesswire.com%20-site%3Aprnewswire.com%20-site%3Aglobenewswire.com&hl=en&gl=US&ceid=US:en',
-};
-
-// ── XML helpers ───────────────────────────────────────────────────────────────
-
-function extractTag(block, tag) {
-  const cdata = block.match(new RegExp(`<${tag}[^>]*><!\\[CDATA\\[([\\s\\S]*?)\\]\\]><\\/${tag}>`));
-  if (cdata) return cdata[1].trim();
-  const plain = block.match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`));
-  return plain ? plain[1].trim() : '';
-}
-
-function extractAttr(block, tag, attr) {
-  const m = block.match(new RegExp(`<${tag}[^>]*\\s${attr}="([^"]*)"[^>]*>`));
-  return m ? m[1].trim() : '';
-}
-
-// ── Dedup helpers ─────────────────────────────────────────────────────────────
-
-function normalizeTitle(title) {
-  return title.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim();
-}
-
-function normalizeUrl(url) {
-  return url.trim().toLowerCase().replace(/\/$/, '');
-}
-
-function tokenize(title) {
-  return new Set(title.split(' ').filter(t => t.length > 1));
-}
-
-function jaccard(a, b) {
-  if (!a.size || !b.size) return 0;
-  let n = 0;
-  for (const t of a) if (b.has(t)) n++;
-  return n / new Set([...a, ...b]).size;
-}
-
-function hashString(input) {
-  let h = 5381;
-  for (let i = 0; i < input.length; i++) h = (h * 33) ^ input.charCodeAt(i);
-  return `n_${(h >>> 0).toString(16)}`;
-}
-
-// ── Core logic ────────────────────────────────────────────────────────────────
-
-async function fetchRssItems(lang, count) {
-  const res = await fetch(RSS_URLS[lang], { headers: { 'User-Agent': 'daily-brew/refresh-news' } });
-  if (!res.ok) throw new Error(`RSS fetch failed: ${res.status}`);
-  const xml = await res.text();
-  const blocks = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)];
-
-  return blocks
-    .map(([, block]) => {
-      const title   = extractTag(block, 'title');
-      const url     = extractTag(block, 'link');
-      const source  = extractTag(block, 'source') || extractAttr(block, 'source', 'url');
-      const pubDate = extractTag(block, 'pubDate');
-      const publishedAt = pubDate ? (isNaN(new Date(pubDate).getTime()) ? null : new Date(pubDate).toISOString()) : null;
-      return { title, url, source, publishedAt };
-    })
-    .filter(item =>
-      item.title &&
-      item.url &&
-      !BLOCKED_SOURCES.some(b => item.source.toLowerCase().includes(b.toLowerCase()))
-    )
-    .slice(0, count);
-}
-
-function deduplicateByTitle(items) {
-  const result = [];
-  for (const item of items) {
-    const tokens = tokenize(normalizeTitle(item.title));
-    if (!result.some(kept => jaccard(tokens, tokenize(normalizeTitle(kept.title))) > 0.6)) {
-      result.push(item);
+      const value = match[2].trim();
+      const quote = value[0];
+      process.env[match[1]] =
+        (quote === '"' || quote === "'") && value.endsWith(quote)
+          ? value.slice(1, -1)
+          : value;
     }
+  } catch {
+    // .dev.vars is optional when the environment is already configured.
   }
-  return result;
-}
-
-async function generateShortTitles(lang, items) {
-  const titlesJson = JSON.stringify(items.map((item, i) => ({ index: i, title: item.title })));
-  const prompt = lang === 'ja'
-    ? `以下のコーヒーニュースのタイトル一覧を見て、各記事の short_title を生成してください。\n\nタイトル一覧:\n${titlesJson}\n\n条件:\n- short_title: 20〜30文字の日本語タイトル（記事の核心を簡潔に）\n- 厳格なJSONのみ返す（マークダウン・前後説明禁止）\n\nJSON形式:\n{\n  "items": [\n    { "index": 0, "short_title": "..." }\n  ]\n}`
-    : `Given the following coffee news titles, generate a short_title for each article.\n\nTitles:\n${titlesJson}\n\nRequirements:\n- short_title: 40-60 character concise title capturing the article's essence\n- Return strict JSON only (no markdown, no extra text)\n\nJSON format:\n{\n  "items": [\n    { "index": 0, "short_title": "..." }\n  ]\n}`;
-
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY },
-      body: JSON.stringify({
-        generationConfig: { responseMimeType: 'application/json', temperature: 0.4 },
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
-      }),
-    }
-  );
-  if (!res.ok) throw new Error(`Gemini API failed: ${res.status}`);
-
-  const data = await res.json();
-  const text = data.candidates?.[0]?.content?.parts?.map(p => p.text ?? '').join('') ?? '';
-  if (!text) return [];
-
-  let parsed;
-  try { parsed = JSON.parse(text); } catch { const m = text.match(/\{[\s\S]*\}/); parsed = m ? JSON.parse(m[0]) : null; }
-  if (!parsed?.items) return [];
-
-  const nowIso = new Date().toISOString();
-  return parsed.items
-    .map(result => {
-      const rss = items[result.index];
-      if (!rss) return null;
-      const short_title = result.short_title?.trim();
-      if (!short_title) return null;
-      return {
-        id: hashString(rss.url.trim().toLowerCase().replace(/\/$/, '') || rss.title),
-        title: rss.title,
-        short_title,
-        url: rss.url,
-        source: rss.source,
-        publishedAt: rss.publishedAt,
-        generatedAt: nowIso,
-      };
-    })
-    .filter(Boolean);
 }
 
 function cleanWranglerEnv() {
-  // Strip CLOUDFLARE_API_TOKEN so wrangler uses its own auth (wrangler login)
-  // instead of a potentially stale token loaded from .dev.vars
   const { CLOUDFLARE_API_TOKEN: _removed, ...cleanEnv } = process.env;
   return cleanEnv;
 }
 
-function readCurrentFromKV(lang) {
-  const key = `${KEY_PREFIX}:current:${lang}`;
+function runWrangler(args, stdio = ['ignore', 'pipe', 'pipe']) {
+  return execFileSync('npx', ['wrangler', ...args], {
+    env: cleanWranglerEnv(),
+    encoding: 'utf8',
+    stdio,
+  });
+}
 
-  try {
-    const value = execFileSync(
-      'npx',
-      ['wrangler', 'kv', 'key', 'get', '--binding', KV_BINDING, '--remote', '--text', key],
-      {
-        env: cleanWranglerEnv(),
-        encoding: 'utf8',
-        stdio: ['ignore', 'pipe', 'pipe'],
-      }
-    ).trim();
+const remoteKv = {
+  async get(key, typeOrOptions) {
+    const value = runWrangler([
+      'kv',
+      'key',
+      'get',
+      '--binding',
+      KV_BINDING,
+      '--remote',
+      '--text',
+      key,
+    ]).trim();
 
     if (!value) return null;
-    return JSON.parse(value);
-  } catch (error) {
-    console.warn(`[${lang}] could not read current KV payload; continuing without recentPublished (${error.message})`);
-    return null;
-  }
-}
+    const type =
+      typeof typeOrOptions === 'string' ? typeOrOptions : typeOrOptions?.type;
+    return type === 'json' ? JSON.parse(value) : value;
+  },
 
-function collectRecentPublishedItems(current) {
-  if (!current) return [];
+  async put(key, value) {
+    runWrangler(
+      [
+        'kv',
+        'key',
+        'put',
+        '--binding',
+        KV_BINDING,
+        '--remote',
+        key,
+        value,
+      ],
+      'inherit',
+    );
+  },
+};
 
-  const seeded = Array.isArray(current.items)
-    ? current.items.map(item => ({
-        url: item.url,
-        title: item.title,
-        generatedAt: item.generatedAt || current.generatedAt,
-      }))
-    : [];
+const requestedLang = process.argv[2];
+const langs = requestedLang === 'ja'
+  ? ['ja']
+  : requestedLang === 'en'
+    ? ['en']
+    : ['ja', 'en'];
 
-  return pruneRecentPublishedItems([...(current.recentPublished ?? []), ...seeded]);
-}
-
-function filterItemsAlreadyPublished(items, recentPublished) {
-  if (recentPublished.length === 0) return items;
-
-  const previousUrls = new Set(
-    recentPublished.map(item => normalizeUrl(item.url ?? '')).filter(Boolean)
-  );
-  const previousTitles = new Set(
-    recentPublished.map(item => normalizeTitle(item.title ?? '')).filter(Boolean)
-  );
-
-  return items.filter(item => {
-    const normalizedUrl = normalizeUrl(item.url);
-    const normalizedTitle = normalizeTitle(item.title);
-    return !previousUrls.has(normalizedUrl) && !previousTitles.has(normalizedTitle);
-  });
-}
-
-function buildRecentPublishedItems(previousItems, latestItems, generatedAt) {
-  const combined = [
-    ...previousItems,
-    ...latestItems.map(item => ({
-      url: item.url,
-      title: item.title,
-      generatedAt,
-    })),
-  ];
-
-  return pruneRecentPublishedItems(combined);
-}
-
-function pruneRecentPublishedItems(items) {
-  const cutoffTime = Date.now() - NO_REPEAT_WINDOW_DAYS * 24 * 60 * 60 * 1000;
-  const seen = new Set();
-
-  return items
-    .filter(item => {
-      const timestamp = new Date(item.generatedAt).getTime();
-      return Number.isFinite(timestamp) && timestamp >= cutoffTime;
-    })
-    .sort((a, b) => new Date(a.generatedAt).getTime() - new Date(b.generatedAt).getTime())
-    .filter(item => {
-      const normalizedUrl = normalizeUrl(item.url ?? '');
-      const normalizedTitle = normalizeTitle(item.title ?? '');
-      const fingerprint = `${normalizedUrl}::${normalizedTitle}`;
-      if (!normalizedUrl && !normalizedTitle) return false;
-      if (seen.has(fingerprint)) return false;
-      seen.add(fingerprint);
-      return true;
-    });
-}
-
-function writeToKV(lang, items, recentPublished) {
-  const key = `${KEY_PREFIX}:current:${lang}`;
-  const generatedAt = new Date().toISOString();
-  const value = JSON.stringify({ lang, generatedAt, items, recentPublished });
-  execFileSync('npx', ['wrangler', 'kv', 'key', 'put', '--binding', KV_BINDING, '--remote', key, value], {
-    env: cleanWranglerEnv(),
-    stdio: 'inherit',
-  });
-}
-
-async function refresh(lang) {
-  console.log(`[${lang}] fetching RSS...`);
-  const current = readCurrentFromKV(lang);
-  const raw = await fetchRssItems(lang, RSS_CANDIDATE_LIMIT);
-  const deduped = deduplicateByTitle(raw);
-  const recentPublished = collectRecentPublishedItems(current);
-  const freshItems = filterItemsAlreadyPublished(deduped, recentPublished);
-  const candidates = freshItems.slice(0, GEMINI_CANDIDATE_LIMIT);
-  if (candidates.length === 0) { console.log(`[${lang}] no fresh items after recentPublished filter, skipped`); return; }
-
-  console.log(`[${lang}] generating short_titles for ${candidates.length} items...`);
-  const items = (await generateShortTitles(lang, candidates)).slice(0, OUTPUT_ITEM_LIMIT);
-  if (items.length === 0) { console.log(`[${lang}] Gemini returned no items, skipped`); return; }
-
-  const generatedAt = new Date().toISOString();
-  const updatedRecentPublished = buildRecentPublishedItems(recentPublished, items, generatedAt);
-
-  console.log(`[${lang}] writing ${items.length} items to KV...`);
-  await writeToKV(lang, items, updatedRecentPublished);
-  console.log(`[${lang}] done: ${items.map(i => i.short_title).join(' / ')}`);
-}
-
-// ── Entry point ───────────────────────────────────────────────────────────────
-
-const langs = process.argv[2] === 'ja' ? ['ja'] : process.argv[2] === 'en' ? ['en'] : ['ja', 'en'];
+const env = {
+  KV_DAILY_BREW: remoteKv,
+  GEMINI_API_KEY: process.env.GEMINI_API_KEY,
+  ALLOWED_ORIGIN: '',
+};
 
 for (const lang of langs) {
-  try {
-    await refresh(lang);
-  } catch (err) {
-    console.error(`[${lang}] failed:`, err.message);
-    process.exit(1);
+  console.log(`[${lang}] running Worker refresh pipeline...`);
+  await refreshLanguageNews(lang, env);
+
+  const status = await remoteKv.get(`daily-brew:status:${lang}`, 'json');
+  console.log(
+    `[${lang}] ${status.result}: ${status.counts.published} items published`,
+  );
+  if (status.result === 'error' || status.result === 'rss_failed') {
+    process.exitCode = 1;
   }
 }
