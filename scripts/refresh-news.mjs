@@ -20,8 +20,15 @@ try {
   const { readFileSync } = await import('fs');
   const devVars = readFileSync(new URL('../.dev.vars', import.meta.url), 'utf8');
   for (const line of devVars.split('\n')) {
-    const m = line.match(/^([A-Z_]+)=(.*)$/);
-    if (m && !process.env[m[1]]) process.env[m[1]] = m[2].trim();
+    const m = line.trim().match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
+    if (!m || process.env[m[1]]) continue;
+
+    const value = m[2].trim();
+    const quote = value[0];
+    process.env[m[1]] =
+      (quote === '"' || quote === "'") && value.endsWith(quote)
+        ? value.slice(1, -1)
+        : value;
   }
 } catch { /* .dev.vars is optional */ }
 
