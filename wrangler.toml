@@ -9,8 +9,8 @@ ALLOWED_ORIGIN = "https://coco-timer.pages.dev,https://neo-brew-timer.pages.dev"
 binding = "KV_DAILY_BREW"
 id = "450ef4b292ae41968d145b327fcf87c9"
 
-[triggers]
-crons = ["0 20 * * *"]
+[placement]
+region = "gcp:asia-northeast1"
 
 [observability]
 enabled = true

@@ -1,0 +1,13 @@
+name = "daily-brew-cron"
+main = "src/index.ts"
+compatibility_date = "2026-02-14"
+
+[triggers]
+crons = ["0 20 * * *"]
+
+[[services]]
+binding = "DAILY_BREW"
+service = "daily-brew"
+
+[observability]
+enabled = true

@@ -29,10 +29,14 @@ type RecentPublishedItem = {
   generatedAt: string;
 };
 
-type CurrentPayload = {
+type StoredNews = {
+  refreshedAt: string;
+  items: NewsItem[];
+};
+
+type CurrentPayload = StoredNews & {
   lang: Lang;
   generatedAt: string;
-  items: NewsItem[];
   recentPublished?: RecentPublishedItem[];
 };
 
@@ -43,7 +47,13 @@ type RunResult =
   | 'rss_failed'
   | 'error';
 
-type RunStatus = {
+type RefreshStatus = {
+  lastAttemptAt?: string;
+  lastSuccessAt?: string;
+  lastError?: string;
+};
+
+type RunStatus = RefreshStatus & {
   lang: Lang;
   runAt: string;
   result: RunResult;
@@ -63,6 +73,20 @@ type RssFetchResult = {
   errorMessage?: string;
 };
 
+type NewsState = 'fresh' | 'stale' | 'refreshed' | 'refresh-failed';
+
+type RefreshOptions = {
+  now?: Date;
+  blocking?: boolean;
+  ignoreCooldown?: boolean;
+};
+
+type RefreshOutcome = {
+  ok: boolean;
+  current: CurrentPayload | null;
+  status: RunStatus;
+};
+
 const KEY_PREFIX = 'daily-brew';
 const GEMINI_MODEL = 'gemini-2.5-flash-lite';
 const RSS_CANDIDATE_LIMIT = 100;
@@ -70,6 +94,8 @@ const GEMINI_CANDIDATE_LIMIT = 20;
 const OUTPUT_ITEM_LIMIT = 5;
 const NO_REPEAT_WINDOW_DAYS = 5;
 const RSS_LOOKBACK_MONTHS = 3;
+const REFRESH_COOLDOWN_MS = 15 * 60 * 1000;
+const RSS_RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
 
 // RSS取得後に source 名で除外するキーワード（プレスリリース配信元や個別に確認した低関連媒体の安全網）
 const BLOCKED_SOURCE_KEYWORDS = [
@@ -152,7 +178,7 @@ export default {
 
     if (request.method === 'GET' && url.pathname === '/news') {
       const lang = normalizeLang(url.searchParams.get('lang'));
-      const response = await handleGetNews(lang, env, ctx);
+      const response = await handleGetNews(lang, env, ctx, request);
       return buildCorsResponse(response, request, env);
     }
 
@@ -168,45 +194,16 @@ export default {
     );
   },
 
-  async scheduled(
-    _controller: ScheduledController,
-    env: Env,
-    _ctx: ExecutionContext,
-  ): Promise<void> {
-    for (const lang of ['ja', 'en'] as Lang[]) {
-      try {
-        await refreshLanguageNews(lang, env);
-      } catch (error) {
-        const errorMessage = getErrorMessage(error);
-        console.error(
-          `[daily-brew] scheduled refresh failed for ${lang}`,
-          errorMessage,
-        );
-        await writeRunStatus(env, {
-          lang,
-          runAt: new Date().toISOString(),
-          result: 'error',
-          counts: emptyRunCounts(),
-          errorMessage,
-        });
-      }
-    }
-  },
 };
 
 async function handleGetNews(
   lang: Lang,
   env: Env,
-  _ctx: ExecutionContext,
+  ctx: ExecutionContext,
+  request: Request,
 ): Promise<Response> {
-  const current = await env.KV_DAILY_BREW.get<CurrentPayload>(
-    kvKey('current', lang),
-    'json',
-  );
-  if (current?.items?.length) {
-    return jsonResponse(current, 200);
-  }
-  return new Response(null, { status: 204 });
+  const blocking = request.headers.get('X-Daily-Brew-Warmup') === 'blocking';
+  return refreshIfStale(lang, env, ctx, { blocking });
 }
 
 async function handleGetStatus(env: Env): Promise<Response> {
@@ -219,29 +216,171 @@ async function handleGetStatus(env: Env): Promise<Response> {
   return jsonResponse({ ja, en }, 200);
 }
 
-export async function refreshLanguageNews(lang: Lang, env: Env): Promise<void> {
+async function readCurrentPayload(env: Env, lang: Lang): Promise<CurrentPayload | null> {
+  const value = await env.KV_DAILY_BREW.get<CurrentPayload | NewsItem[]>(
+    kvKey('current', lang),
+    'json',
+  );
+  return normalizeStoredNews(lang, value);
+}
+
+function normalizeStoredNews(
+  lang: Lang,
+  value: CurrentPayload | NewsItem[] | null,
+): CurrentPayload | null {
+  if (!value) return null;
+  if (Array.isArray(value)) {
+    const generatedAt = value[0]?.generatedAt ?? new Date(0).toISOString();
+    return { lang, generatedAt, refreshedAt: generatedAt, items: value };
+  }
+  const items = Array.isArray(value.items) ? value.items : [];
+  const generatedAt =
+    value.generatedAt ?? value.refreshedAt ?? items[0]?.generatedAt ?? new Date(0).toISOString();
+  return {
+    ...value,
+    lang: value.lang ?? lang,
+    generatedAt,
+    refreshedAt: value.refreshedAt ?? generatedAt,
+    items,
+  };
+}
+
+export function getJstNewsDayStart(now: Date): Date {
+  const jst = new Date(now.getTime() + 9 * 60 * 60 * 1000);
+  const y = jst.getUTCFullYear();
+  const m = jst.getUTCMonth();
+  const d = jst.getUTCDate();
+  const hour = jst.getUTCHours();
+  const newsDayStartJst = Date.UTC(y, m, hour < 5 ? d - 1 : d, 5, 0, 0, 0);
+  return new Date(newsDayStartJst - 9 * 60 * 60 * 1000);
+}
+
+export function isNewsFresh(news: StoredNews | CurrentPayload, now = new Date()): boolean {
+  const refreshedAt = new Date(news.refreshedAt).getTime();
+  return Number.isFinite(refreshedAt) && refreshedAt >= getJstNewsDayStart(now).getTime();
+}
+
+async function shouldAttemptRefresh(env: Env, lang: Lang, now: Date): Promise<boolean> {
+  return !isRefreshCoolingDown(await readRefreshStatus(env, lang), now);
+}
+
+function isRefreshCoolingDown(status: RefreshStatus | null, now: Date): boolean {
+  if (!status?.lastAttemptAt || !status.lastError) return false;
+  const lastAttempt = new Date(status.lastAttemptAt).getTime();
+  return Number.isFinite(lastAttempt) && now.getTime() - lastAttempt < REFRESH_COOLDOWN_MS;
+}
+
+async function readRefreshStatus(env: Env, lang: Lang): Promise<RunStatus | null> {
+  return env.KV_DAILY_BREW.get<RunStatus>(kvKey('status', lang), 'json');
+}
+
+function createNewsResponse(
+  current: CurrentPayload | null,
+  status: number,
+  state: NewsState,
+  errorMessage?: string,
+): Response {
+  const response = current?.items?.length
+    ? jsonResponse(current, status)
+    : jsonResponse({ error: errorMessage ?? 'News unavailable' }, status);
+  response.headers.set('X-Daily-Brew-State', state);
+  if (current?.refreshedAt) {
+    response.headers.set('X-Daily-Brew-Refreshed-At', current.refreshedAt);
+  }
+  return response;
+}
+
+async function refreshIfStale(
+  lang: Lang,
+  env: Env,
+  ctx: ExecutionContext,
+  options: RefreshOptions = {},
+): Promise<Response> {
+  const now = options.now ?? new Date();
+  const current = await readCurrentPayload(env, lang);
+
+  if (current?.items?.length && isNewsFresh(current, now)) {
+    return createNewsResponse(current, 200, 'fresh');
+  }
+
+  if (options.blocking) {
+    const outcome = await refreshLanguageNews(lang, env, {
+      now,
+      blocking: true,
+    });
+    if (outcome.ok && outcome.current) {
+      return createNewsResponse(outcome.current, 200, 'refreshed');
+    }
+    return createNewsResponse(
+      current,
+      503,
+      'refresh-failed',
+      outcome.status.errorMessage,
+    );
+  }
+
+  if (current?.items?.length) {
+    if (await shouldAttemptRefresh(env, lang, now)) {
+      ctx.waitUntil(refreshLanguageNews(lang, env, { now }));
+    }
+    return createNewsResponse(current, 200, 'stale');
+  }
+
+  const outcome = await refreshLanguageNews(lang, env, {
+    now,
+    ignoreCooldown: true,
+  });
+  if (outcome.ok && outcome.current) {
+    return createNewsResponse(outcome.current, 200, 'refreshed');
+  }
+  return createNewsResponse(null, 503, 'refresh-failed', outcome.status.errorMessage);
+}
+
+export async function refreshLanguageNews(
+  lang: Lang,
+  env: Env,
+  options: RefreshOptions = {},
+): Promise<RefreshOutcome> {
   const runAt = new Date().toISOString();
   const counts = emptyRunCounts();
+  const previousStatus = await readRefreshStatus(env, lang);
 
   try {
-    const current = await env.KV_DAILY_BREW.get<CurrentPayload>(
-      kvKey('current', lang),
-      'json',
-    );
+    if (
+      !options.ignoreCooldown &&
+      !options.blocking &&
+      isRefreshCoolingDown(previousStatus, options.now ?? new Date())
+    ) {
+      const status = {
+        ...previousStatus,
+        lang,
+        runAt,
+        result: 'error',
+        counts,
+        errorMessage: `Refresh suppressed by ${REFRESH_COOLDOWN_MS / 60000}-minute cooldown`,
+      } satisfies RunStatus;
+      await writeRunStatus(env, status);
+      return { ok: false, current: await readCurrentPayload(env, lang), status };
+    }
+
+    const current = await readCurrentPayload(env, lang);
     const rssResult = await fetchRssItems(lang, RSS_CANDIDATE_LIMIT);
     counts.rssFetched = rssResult.items.length;
 
     if (!rssResult.ok) {
       const status = {
+        ...previousStatus,
         lang,
         runAt,
         result: 'rss_failed',
         counts,
         errorMessage: rssResult.errorMessage,
+        lastAttemptAt: runAt,
+        lastError: rssResult.errorMessage,
       } satisfies RunStatus;
       console.error(`[daily-brew] skipped ${lang}: ${rssResult.errorMessage}`);
       await writeRunStatus(env, status);
-      return;
+      return { ok: false, current, status };
     }
 
     const deduped = deduplicateByTitle(rssResult.items);
@@ -253,12 +392,15 @@ export async function refreshLanguageNews(lang: Lang, env: Env): Promise<void> {
     if (freshItems.length === 0) {
       console.log(`[daily-brew] skipped ${lang}: no fresh RSS items in ${NO_REPEAT_WINDOW_DAYS} days`);
       await writeRunStatus(env, {
+        ...previousStatus,
         lang,
         runAt,
         result: 'skipped_no_fresh',
         counts,
+        lastAttemptAt: runAt,
+        lastSuccessAt: runAt,
       });
-      return;
+      return { ok: true, current, status: { ...previousStatus, lang, runAt, result: 'skipped_no_fresh', counts, lastAttemptAt: runAt, lastSuccessAt: runAt } };
     }
 
     const generatedItems = await generateShortTitles(
@@ -273,12 +415,15 @@ export async function refreshLanguageNews(lang: Lang, env: Env): Promise<void> {
     if (items.length === 0) {
       console.log(`[daily-brew] skipped ${lang}: Gemini returned no items`);
       await writeRunStatus(env, {
+        ...previousStatus,
         lang,
         runAt,
         result: 'skipped_gemini_empty',
         counts,
+        lastAttemptAt: runAt,
+        lastSuccessAt: runAt,
       });
-      return;
+      return { ok: true, current, status: { ...previousStatus, lang, runAt, result: 'skipped_gemini_empty', counts, lastAttemptAt: runAt, lastSuccessAt: runAt } };
     }
 
     const generatedAt = new Date().toISOString();
@@ -293,29 +438,45 @@ export async function refreshLanguageNews(lang: Lang, env: Env): Promise<void> {
       JSON.stringify({
         lang,
         generatedAt,
+        refreshedAt: generatedAt,
         items,
         recentPublished: updatedRecentPublished,
       }),
     );
 
-    await writeRunStatus(env, {
+    const status = {
+      ...previousStatus,
       lang,
       runAt,
       result: 'updated',
       counts,
-    });
+      lastAttemptAt: runAt,
+      lastSuccessAt: generatedAt,
+      lastError: undefined,
+    } satisfies RunStatus;
+    await writeRunStatus(env, status);
 
     console.log(`[daily-brew] updated ${lang}: ${items.length} items`);
+    return {
+      ok: true,
+      current: { lang, generatedAt, refreshedAt: generatedAt, items, recentPublished: updatedRecentPublished },
+      status,
+    };
   } catch (error) {
     const errorMessage = getErrorMessage(error);
     console.error(`[daily-brew] refresh failed for ${lang}`, errorMessage);
-    await writeRunStatus(env, {
+    const status = {
+      ...previousStatus,
       lang,
       runAt,
       result: 'error',
       counts,
       errorMessage,
-    });
+      lastAttemptAt: runAt,
+      lastError: errorMessage,
+    } satisfies RunStatus;
+    await writeRunStatus(env, status);
+    return { ok: false, current: await readCurrentPayload(env, lang), status };
   }
 }
 
@@ -399,12 +560,10 @@ function pruneRecentPublishedItems(
 }
 
 async function fetchRssItems(lang: Lang, count: number): Promise<RssFetchResult> {
-  const response = await fetch(buildGoogleNewsRssUrl(lang), {
-    headers: { 'User-Agent': 'daily-brew/1.0' },
-  });
+  const response = await fetchRssWithRetry(lang);
 
   if (!response.ok) {
-    const errorMessage = `RSS fetch failed with HTTP ${response.status}`;
+    const errorMessage = await buildRssErrorMessage(lang, response);
     console.error(`[daily-brew] ${errorMessage} for ${lang}`);
     return { ok: false, items: [], errorMessage };
   }
@@ -467,6 +626,67 @@ async function fetchRssItems(lang: Lang, count: number): Promise<RssFetchResult>
   };
 }
 
+async function fetchRssWithRetry(lang: Lang): Promise<Response> {
+  let lastResponse: Response | null = null;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    const response = await fetch(buildGoogleNewsRssUrl(lang), {
+      headers: buildRssHeaders(lang, attempt),
+    });
+    (response as Response & { rssAttempt?: number }).rssAttempt = attempt;
+    if (response.ok || !RSS_RETRYABLE_STATUSES.has(response.status) || attempt === 3) {
+      return response;
+    }
+    lastResponse = response;
+    await sleep(getRetryDelayMs(response, attempt));
+  }
+  return lastResponse ?? new Response(null, { status: 503 });
+}
+
+function buildRssHeaders(lang: Lang, attempt: number): HeadersInit {
+  return {
+    'User-Agent': 'daily-brew/1.0 (+https://github.com/takatama/daily-brew)',
+    Accept: 'application/rss+xml, application/xml;q=0.9, */*;q=0.8',
+    'Accept-Language': lang === 'ja' ? 'ja-JP,ja;q=0.9' : 'en-US,en;q=0.9',
+    'X-Daily-Brew-Retry-Attempt': String(attempt),
+  };
+}
+
+function getRetryDelayMs(response: Response, attempt: number): number {
+  const retryAfter = response.headers.get('Retry-After');
+  if (retryAfter) {
+    const seconds = Number(retryAfter);
+    if (Number.isFinite(seconds)) {
+      return Math.min(Math.max(seconds * 1000, 0), 30_000);
+    }
+    const timestamp = Date.parse(retryAfter);
+    if (Number.isFinite(timestamp)) {
+      return Math.min(Math.max(timestamp - Date.now(), 0), 30_000);
+    }
+  }
+  return Math.min(2 ** (attempt - 1) * 1000 + Math.floor(Math.random() * 250), 30_000);
+}
+
+async function buildRssErrorMessage(lang: Lang, response: Response): Promise<string> {
+  const attempt = (response as Response & { rssAttempt?: number }).rssAttempt ?? 1;
+  const body = normalizeDiagnosticBody(await response.clone().text());
+  const details = [
+    `lang=${lang}`,
+    `status=${response.status}`,
+    `attempts=${attempt}`,
+    `server=${response.headers.get('server') ?? 'unknown'}`,
+    `content-type=${response.headers.get('content-type') ?? 'unknown'}`,
+  ];
+  if (body) details.push(`body="${body}"`);
+  return `RSS fetch failed (${details.join(', ')})`;
+}
+
+function normalizeDiagnosticBody(text: string): string {
+  return text.replace(/\s+/g, ' ').trim().slice(0, 400);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function filterItemsByPublishedAtWindow(items: RssItem[], months: number): RssItem[] {
   const cutoff = new Date();
@@ -793,6 +1013,10 @@ function buildCorsResponse(
   headers.set('Vary', 'Origin');
   headers.set('Access-Control-Allow-Methods', 'GET, OPTIONS');
   headers.set('Access-Control-Allow-Headers', 'Content-Type');
+  headers.set(
+    'Access-Control-Expose-Headers',
+    'X-Daily-Brew-State, X-Daily-Brew-Refreshed-At',
+  );
 
   if (origin && isAllowedOrigin(origin, env.ALLOWED_ORIGIN)) {
     headers.set('Access-Control-Allow-Origin', origin);
