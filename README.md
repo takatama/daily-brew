@@ -158,3 +158,91 @@ if (res.status === 204) {
 }
 const { items } = await res.json();
 ```
+
+## Cron Split / Placement Architecture
+
+`daily-brew` no longer owns a Cron Trigger. The runtime architecture is now:
+
+```text
+daily-brew-cron
+  scheduled() at 0 20 * * * UTC (05:00 JST)
+    -> HTTP Service Binding DAILY_BREW
+      -> daily-brew GET /news?lang=ja
+      -> daily-brew GET /news?lang=en
+        -> refreshes from Google News RSS only when stale
+```
+
+### Worker roles
+
+- `daily-brew`
+  - Serves the public `GET /news?lang=ja|en` and `GET /status` endpoints.
+  - Uses `[placement] region = "gcp:asia-northeast1"` so HTTP `fetch()` requests run near Tokyo.
+  - Stores current news as `{ refreshedAt, items }` plus the existing compatibility fields (`lang`, `generatedAt`, `recentPublished`).
+  - Treats a news day as fresh from 05:00 JST, calculated explicitly and independently of the Worker runtime timezone.
+  - On normal user traffic, returns stale data immediately and refreshes in `ctx.waitUntil()` when possible.
+  - If no data exists, waits for refresh and returns `503` if refresh fails.
+  - Applies a per-language 15-minute cooldown after failed refresh attempts to avoid retrying Google News RSS on every user request.
+
+- `daily-brew-cron`
+  - Owns the Cloudflare Cron Trigger `0 20 * * *` (UTC, which is 05:00 JST).
+  - Calls `daily-brew` via HTTP Service Binding, sequentially for `ja` then `en`.
+  - Sends `X-Daily-Brew-Warmup: blocking`, which makes stale refreshes wait for RSS/Gemini/KV completion.
+  - Fails the Cron run when `daily-brew` returns a non-2xx response, including language, HTTP status, refresh state, and a short response-body snippet in the thrown error.
+
+### Refresh response headers
+
+`GET /news` preserves the existing JSON body shape as much as possible and reports refresh state through headers:
+
+- `X-Daily-Brew-State: fresh` — cached news is valid for the current JST news day.
+- `X-Daily-Brew-State: stale` — stale news was returned immediately; a normal request may have scheduled a background refresh.
+- `X-Daily-Brew-State: refreshed` — the request waited for a successful refresh.
+- `X-Daily-Brew-State: refresh-failed` — refresh failed; stale data may be returned to users, while blocking warmup returns `503`.
+- `X-Daily-Brew-Refreshed-At: <ISO timestamp>` — timestamp of the stored news payload when available.
+
+The CORS response exposes these headers with `Access-Control-Expose-Headers`.
+
+### RSS retry and diagnostics
+
+Google News RSS requests include an explicit `User-Agent`, XML-oriented `Accept`, and per-language `Accept-Language`. Transient statuses (`429`, `500`, `502`, `503`, `504`) are retried up to three times with exponential backoff, jitter, and bounded `Retry-After` support. RSS failures recorded in `/status` include language, HTTP status, selected response headers, attempt count, and a normalized short body snippet.
+
+### Deployment order
+
+Deploy in this order so the Service Binding can resolve the target Worker:
+
+1. Deploy `daily-brew` first:
+   ```bash
+   npx wrangler deploy
+   ```
+2. Deploy the Cron Worker from its directory:
+   ```bash
+   cd cron-worker
+   npx wrangler deploy
+   ```
+3. Confirm in Cloudflare that the `daily-brew-cron` Service Binding points to service `daily-brew` with binding name `DAILY_BREW`. The repository contains this in `cron-worker/wrangler.toml`, but account-level deployment permissions still need to allow binding resolution.
+
+Do not add a Cron Trigger back to `daily-brew`; only `daily-brew-cron` should have `[triggers]`.
+
+### Manual verification
+
+Run `daily-brew` locally:
+
+```bash
+npx wrangler dev
+```
+
+Verify normal access and state headers:
+
+```bash
+curl -i "http://localhost:8787/news?lang=ja" -H "Origin: https://coco-timer.pages.dev"
+curl -i "http://localhost:8787/news?lang=en" -H "Origin: https://coco-timer.pages.dev"
+curl -i "http://localhost:8787/status"
+```
+
+Verify the blocking warmup behavior against a deployed `daily-brew` Worker or local equivalent:
+
+```bash
+curl -i "https://<daily-brew-host>/news?lang=ja" -H "X-Daily-Brew-Warmup: blocking"
+curl -i "https://<daily-brew-host>/news?lang=en" -H "X-Daily-Brew-Warmup: blocking"
+```
+
+If `daily-brew-cron` fails, normal user access to `/news` can still self-recover: fresh cached data is served directly, stale cached data is served while a background refresh is attempted, and an empty cache waits for refresh before returning data or `503`.
