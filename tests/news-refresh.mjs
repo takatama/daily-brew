@@ -114,6 +114,28 @@ test('503 RSS response is retried up to three times', async () => {
   assert.equal(getCalls(), 3);
 });
 
+test('successful refresh clears errors left by the previous run', async () => {
+  mockPipelineFetch();
+  const previousStatus = JSON.stringify({
+    lang: 'ja',
+    runAt: '2026-07-24T20:00:00.000Z',
+    result: 'rss_failed',
+    counts: { rssFetched: 0, afterDedup: 0, afterNoRepeat: 0, geminiReturned: 0, published: 0 },
+    errorMessage: 'RSS fetch failed with HTTP 503',
+    lastAttemptAt: '2026-07-24T20:00:00.000Z',
+    lastError: 'RSS fetch failed with HTTP 503',
+  });
+  const e = env({ 'daily-brew:status:ja': previousStatus });
+
+  const outcome = await worker.refreshLanguageNews('ja', e, { ignoreCooldown: true });
+  const storedStatus = JSON.parse(e.KV_DAILY_BREW.map.get('daily-brew:status:ja'));
+
+  assert.equal(outcome.ok, true);
+  assert.equal(storedStatus.result, 'updated');
+  assert.equal('errorMessage' in storedStatus, false);
+  assert.equal('lastError' in storedStatus, false);
+});
+
 test('cooldown suppresses user refresh and languages remain isolated', async () => {
   const getCalls = mockPipelineFetch();
   const recentFail = JSON.stringify({ lang:'ja', runAt:'2026-07-23T19:50:00.000Z', result:'rss_failed', counts:{rssFetched:0,afterDedup:0,afterNoRepeat:0,geminiReturned:0,published:0}, lastAttemptAt: new Date().toISOString(), lastError:'RSS failed' });
