@@ -391,7 +391,7 @@ export async function refreshLanguageNews(
 
     if (freshItems.length === 0) {
       console.log(`[daily-brew] skipped ${lang}: no fresh RSS items in ${NO_REPEAT_WINDOW_DAYS} days`);
-      await writeRunStatus(env, {
+      const status = {
         ...previousStatus,
         lang,
         runAt,
@@ -399,8 +399,11 @@ export async function refreshLanguageNews(
         counts,
         lastAttemptAt: runAt,
         lastSuccessAt: runAt,
-      });
-      return { ok: true, current, status: { ...previousStatus, lang, runAt, result: 'skipped_no_fresh', counts, lastAttemptAt: runAt, lastSuccessAt: runAt } };
+        errorMessage: undefined,
+        lastError: undefined,
+      } satisfies RunStatus;
+      await writeRunStatus(env, status);
+      return { ok: true, current, status };
     }
 
     const generatedItems = await generateShortTitles(
@@ -414,7 +417,7 @@ export async function refreshLanguageNews(
 
     if (items.length === 0) {
       console.log(`[daily-brew] skipped ${lang}: Gemini returned no items`);
-      await writeRunStatus(env, {
+      const status = {
         ...previousStatus,
         lang,
         runAt,
@@ -422,8 +425,11 @@ export async function refreshLanguageNews(
         counts,
         lastAttemptAt: runAt,
         lastSuccessAt: runAt,
-      });
-      return { ok: true, current, status: { ...previousStatus, lang, runAt, result: 'skipped_gemini_empty', counts, lastAttemptAt: runAt, lastSuccessAt: runAt } };
+        errorMessage: undefined,
+        lastError: undefined,
+      } satisfies RunStatus;
+      await writeRunStatus(env, status);
+      return { ok: true, current, status };
     }
 
     const generatedAt = new Date().toISOString();
@@ -452,6 +458,7 @@ export async function refreshLanguageNews(
       counts,
       lastAttemptAt: runAt,
       lastSuccessAt: generatedAt,
+      errorMessage: undefined,
       lastError: undefined,
     } satisfies RunStatus;
     await writeRunStatus(env, status);
