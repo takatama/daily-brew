@@ -64,7 +64,7 @@ Returns the latest scheduled-run status for both languages. This endpoint does n
 
 ### CORS
 
-- `Access-Control-Allow-Origin` is set when the request `Origin` matches one of the comma-separated `ALLOWED_ORIGIN` entries exactly or is a subdomain of one of them (e.g. `*.coco-timer.pages.dev`, `*.neo-brew-timer.pages.dev`)
+- `Access-Control-Allow-Origin: *` is returned so the stored JSON can be read from any domain
 - `OPTIONS` preflight is supported
 
 ## KV Keys

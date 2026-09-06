@@ -102,7 +102,6 @@ const langs = requestedLang === 'ja'
 const env = {
   KV_DAILY_BREW: remoteKv,
   GEMINI_API_KEY: process.env.GEMINI_API_KEY,
-  ALLOWED_ORIGIN: '',
 };
 
 for (const lang of langs) {

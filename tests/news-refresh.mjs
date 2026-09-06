@@ -22,7 +22,7 @@ class KV {
 }
 
 function env(entries = {}) {
-  return { KV_DAILY_BREW: new KV(entries), GEMINI_API_KEY: 'test', ALLOWED_ORIGIN: '' };
+  return { KV_DAILY_BREW: new KV(entries), GEMINI_API_KEY: 'test' };
 }
 function ctx() {
   const tasks = [];
@@ -63,6 +63,37 @@ test('fresh /news does not fetch RSS', async () => {
   assert.equal(res.status, 200);
   assert.equal(res.headers.get('X-Daily-Brew-State'), 'fresh');
   assert.equal(getCalls(), 0);
+});
+
+test('/news allows the stored JSON to be read from any origin', async () => {
+  mockPipelineFetch();
+  const e = env({ 'daily-brew:current:ja': current('ja', '2999-01-01T00:00:00.000Z') });
+
+  for (const origin of ['https://example.com', 'https://unrelated.test']) {
+    const res = await worker.default.fetch(
+      new Request('https://api.test/news?lang=ja', { headers: { Origin: origin } }),
+      e,
+      ctx(),
+    );
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get('Access-Control-Allow-Origin'), '*');
+    assert.equal((await res.json()).items[0].title, 'Coffee');
+  }
+});
+
+test('CORS preflight allows requests from any origin', async () => {
+  const res = await worker.default.fetch(
+    new Request('https://api.test/news?lang=ja', {
+      method: 'OPTIONS',
+      headers: { Origin: 'https://unrelated.test' },
+    }),
+    env(),
+    ctx(),
+  );
+
+  assert.equal(res.status, 204);
+  assert.equal(res.headers.get('Access-Control-Allow-Origin'), '*');
+  assert.equal(res.headers.get('Access-Control-Allow-Methods'), 'GET, OPTIONS');
 });
 
 test('stale normal access returns stale and schedules background refresh', async () => {
