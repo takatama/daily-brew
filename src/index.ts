@@ -1,7 +1,6 @@
 interface Env {
   KV_DAILY_BREW: KVNamespace;
   GEMINI_API_KEY: string;
-  ALLOWED_ORIGIN: string;
 }
 
 type Lang = 'ja' | 'en';
@@ -169,29 +168,21 @@ export default {
     const url = new URL(request.url);
 
     if (request.method === 'OPTIONS') {
-      return buildCorsResponse(
-        new Response(null, { status: 204 }),
-        request,
-        env,
-      );
+      return buildCorsResponse(new Response(null, { status: 204 }));
     }
 
     if (request.method === 'GET' && url.pathname === '/news') {
       const lang = normalizeLang(url.searchParams.get('lang'));
       const response = await handleGetNews(lang, env, ctx, request);
-      return buildCorsResponse(response, request, env);
+      return buildCorsResponse(response);
     }
 
     if (request.method === 'GET' && url.pathname === '/status') {
       const response = await handleGetStatus(env);
-      return buildCorsResponse(response, request, env);
+      return buildCorsResponse(response);
     }
 
-    return buildCorsResponse(
-      jsonResponse({ error: 'Not Found' }, 404),
-      request,
-      env,
-    );
+    return buildCorsResponse(jsonResponse({ error: 'Not Found' }, 404));
   },
 
 };
@@ -988,46 +979,15 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
-function isAllowedOrigin(origin: string, allowedOrigins: string): boolean {
-  return allowedOrigins
-    .split(',')
-    .map((allowed) => allowed.trim())
-    .filter(Boolean)
-    .some((allowed) => isOriginMatch(origin, allowed));
-}
-
-function isOriginMatch(origin: string, allowed: string): boolean {
-  if (origin === allowed) return true;
-  try {
-    const o = new URL(origin);
-    const a = new URL(allowed);
-    return (
-      o.protocol === a.protocol &&
-      (o.hostname === a.hostname || o.hostname.endsWith(`.${a.hostname}`))
-    );
-  } catch {
-    return false;
-  }
-}
-
-function buildCorsResponse(
-  response: Response,
-  request: Request,
-  env: Env,
-): Response {
-  const origin = request.headers.get('Origin');
+function buildCorsResponse(response: Response): Response {
   const headers = new Headers(response.headers);
-  headers.set('Vary', 'Origin');
+  headers.set('Access-Control-Allow-Origin', '*');
   headers.set('Access-Control-Allow-Methods', 'GET, OPTIONS');
   headers.set('Access-Control-Allow-Headers', 'Content-Type');
   headers.set(
     'Access-Control-Expose-Headers',
     'X-Daily-Brew-State, X-Daily-Brew-Refreshed-At',
   );
-
-  if (origin && isAllowedOrigin(origin, env.ALLOWED_ORIGIN)) {
-    headers.set('Access-Control-Allow-Origin', origin);
-  }
 
   return new Response(response.body, {
     status: response.status,
